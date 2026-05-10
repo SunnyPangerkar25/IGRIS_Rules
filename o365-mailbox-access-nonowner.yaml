@@ -1,0 +1,87 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Microsoft 365 - Mailbox Accessed by Non-Owner (Delegate or Admin Fan-Out)"
+enabled: true
+description: |
+  Detects when a single actor (identified by LogonUserSid) accesses three or
+  more distinct mailboxes as a non-owner (Delegate, Admin, or Transport logon
+  type) within a one-hour window. Legitimate delegate relationships are
+  typically 1-2 mailboxes; fan-out to 3+ is an indicator of compromised
+  delegate tokens, stolen OAuth grants, or an attacker moving through an
+  Exchange environment collecting email.
+
+  Microsoft LogonType semantics:
+    0 = Owner (excluded - normal)
+    1 = Admin (tenant admin using admin rights)
+    2 = Delegate (granted delegate access)
+    3 = Transport (Exchange transport agent)
+
+  References:
+  * https://attack.mitre.org/techniques/T1114/002/
+  * https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema#exchange-mailbox-schema
+
+# MITRE ATT&CK: T1114.002 - Remote Email Collection (TA0009 - Collection)
+# OCSF Class: Email Activity (4009)
+# Log Source: O365 Exchange (ocsf_mapped)
+# Note: Email Activity class has NO actor.user.* mapping in this Scanner
+# instance (baseline §4.1). Actor identity is unmapped.LogonUserSid (Windows
+# SID). SID-to-UPN resolution is a downstream enrichment concern.
+# Note: Scanner has NO != operator; LogonType > 0 expresses "not owner".
+# Validated 2026-04-08: fe63b=43 distinct actors at threshold, one delegate
+# touching 8 mailboxes / 10,981 accesses. 34cff=0 (no delegate access in 4w).
+severity: High
+
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1] = "O365"
+  class_uid = 4009
+  unmapped.Operation: "MailItemsAccessed"
+  unmapped.LogonType > 0
+  | stats count() as access_count, countdistinct(unmapped.MailboxOwnerUPN) as mailbox_count
+    by ig_tenant_id, %ingest.import_rule_name, unmapped.LogonUserSid, unmapped.LogonType
+  | where(mailbox_count >= 3)
+  | rename(unmapped.LogonUserSid as actor_sid, unmapped.LogonType as logon_type)
+
+tags:
+  - techniques.t1114.email_collection
+
+time_range_s: 3600
+run_frequency_s: 600
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Data Collection"
+    - label: "incident_subtype"
+      value: "Non-Owner Mailbox Fan-Out Access (M365)"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "actor_sid"
+    - label: "actor_sid"
+      value: "{{@alert.results_table.rows[0].actor_sid}}"
+
+tests:
+  - name: "Positive - one delegate reads 3 distinct mailboxes"
+    now_timestamp: "2026-04-07T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-07T11:20:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":2,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"ceo@example.com"}}
+      {"timestamp":"2026-04-07T11:25:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":2,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"cfo@example.com"}}
+      {"timestamp":"2026-04-07T11:30:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":2,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"coo@example.com"}}
+    expected_detection_result: true
+
+  - name: "Negative - delegate reads only 2 distinct mailboxes"
+    now_timestamp: "2026-04-07T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-07T11:20:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":2,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"ceo@example.com"}}
+      {"timestamp":"2026-04-07T11:25:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":2,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"cfo@example.com"}}
+    expected_detection_result: false
+
+  - name: "Negative - owner-only access (LogonType=0, excluded)"
+    now_timestamp: "2026-04-07T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-07T11:20:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":0,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"alice@example.com"}}
+      {"timestamp":"2026-04-07T11:25:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":0,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"bob@example.com"}}
+      {"timestamp":"2026-04-07T11:30:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":4009,"unmapped":{"Operation":"MailItemsAccessed","LogonType":0,"LogonUserSid":"S-1-5-21-1111-2222-3333-1001","MailboxOwnerUPN":"carol@example.com"}}
+    expected_detection_result: false

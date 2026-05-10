@@ -1,0 +1,71 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Barracuda EGD - Scam Campaign Burst"
+enabled: true
+description: |
+  Detects 5 or more scam-classified emails (taxonomy=scamming) from a single source
+  IP within 1 hour. A burst indicates an active scam campaign — typically sextortion
+  ("I recorded you"), advance-fee fraud, or fake invoice schemes.
+
+# TI Source: Build from data.
+# Flood Check: PASS (221 Aerizome, 0 Kedaara over 4w 2026-03-13 to 2026-04-10 — 0.33/hr max).
+# References:
+#   - MITRE ATT&CK T1566.001 - Phishing: Spearphishing Attachment (TA0001)
+severity: Medium
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+    metadata.labels[1]="BARRACUDA" class_name="Email Activity"
+    unmapped.barracuda.%json.payload.recipients[0].taxonomy="scamming"
+  | stats count() as event_count
+      by ig_tenant_id, %ingest.import_rule_name, src_endpoint.ip,
+         unmapped.barracuda.%json.payload.hdr_from,
+         unmapped.barracuda.%json.payload.hdr_to,
+         unmapped.barracuda.%json.payload.recipients[0].action,
+         unmapped.barracuda.%json.payload.recipients[0].reason,
+         email.subject
+  | where(event_count >= 5)
+  | rename(unmapped.barracuda.%json.payload.hdr_from as sender,
+           unmapped.barracuda.%json.payload.hdr_to as recipient,
+           unmapped.barracuda.%json.payload.recipients[0].action as action,
+           unmapped.barracuda.%json.payload.recipients[0].reason as reason,
+           src_endpoint.ip as source_ip)
+
+tags:
+  - techniques.t1566_001.spearphishing_attachment
+
+time_range_s: 3600
+run_frequency_s: 300
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Email Threat"
+    - label: "incident_subtype"
+      value: "Scam Campaign Burst"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "source_ip"
+    - label: "key_entity"
+      value: "{{source_ip}}"
+
+tests:
+  - name: "Positive - 5 scam emails from same source to same recipient"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:02:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:03:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:04:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:05:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - only 4 scam emails (below threshold)"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:02:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:03:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:04:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"scamming","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].reason":"taxonomy_blackmail","unmapped.barracuda.%json.payload.hdr_from":"scammer@fake.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"180.94.85.24","email.subject":"YOU PERVERT I RECORDED YOU","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: false

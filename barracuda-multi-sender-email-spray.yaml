@@ -1,0 +1,95 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Barracuda EGD - Multi-Sender Email Spray (Compromised Infrastructure)"
+enabled: true
+description: |
+  Detects 10 or more distinct envelope senders from the same source IP within
+  6 hours. This behavioral pattern indicates compromised mail infrastructure,
+  bulk-registered domain abuse, or SaaS tenant compromise — multiple mailboxes
+  on the same server spraying a target organization. No taxonomy filter applied:
+  catches zero-day campaigns where Barracuda has not yet classified the threat.
+
+# MITRE ATT&CK: T1586.002 - Compromise Accounts: Email Accounts (TA0042 - Resource Development)
+# OCSF Class: Email Activity (4009)
+# Log Source: Barracuda EGD (ocsf_mapped)
+# TI Source: Build from data. Tradecraft: compromised infrastructure spray / domain-based
+#   phishing campaign. No existing rules in Scanner/Sigma/Splunk/Elastic for this pattern.
+# Flood Check: PASS — max 6 unique senders per IP over 4w (both tenants). 0.04 events/hr max.
+#   Threshold of 10 is conservative for current volume. Consider lowering to 5 if data grows.
+# References:
+#   - MITRE ATT&CK T1586.002 - Compromise Accounts: Email Accounts
+#   - Barracuda EGD schema: Knowledge_Base/Schema/Barracuda_EGD_schema.md
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+    metadata.labels[1]="BARRACUDA" class_name="Email Activity"
+  | stats count() as event_count,
+      countdistinct(unmapped.barracuda.%json.payload.env_from) as unique_senders
+      by ig_tenant_id, %ingest.import_rule_name, src_endpoint.ip
+  | where(unique_senders >= 10)
+  | rename(src_endpoint.ip as source_ip)
+
+tags:
+  - techniques.t1586_002.compromise_accounts_email
+
+time_range_s: 21600
+run_frequency_s: 900
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Email Threat"
+    - label: "incident_subtype"
+      value: "Multi-Sender Email Spray (Compromised Infrastructure)"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "source_ip"
+    - label: "key_entity"
+      value: "{{source_ip}}"
+
+tests:
+  - name: "Positive - 10 distinct senders from same IP"
+    now_timestamp: "2026-04-08T19:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T13:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender1@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:05:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender2@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:10:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender3@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:15:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender4@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:20:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender5@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:25:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender6@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:30:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender7@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:35:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender8@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:40:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender9@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:45:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender10@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - only 9 distinct senders (below threshold)"
+    now_timestamp: "2026-04-08T19:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T13:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender1@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:05:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender2@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:10:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender3@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:15:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender4@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:20:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender5@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:25:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender6@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:30:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender7@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:35:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender8@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:40:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"sender9@compromised.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: false
+
+  - name: "Negative - 10 emails but same sender (not multi-sender)"
+    now_timestamp: "2026-04-08T19:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T13:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:05:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:10:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:15:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:20:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:25:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:30:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:35:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:40:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T13:45:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.env_from":"same-sender@legit.com","src_endpoint.ip":"198.51.100.50","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: false

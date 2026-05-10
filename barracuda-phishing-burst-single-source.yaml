@@ -1,0 +1,69 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Barracuda EGD - Phishing Burst from Single Source"
+enabled: true
+description: |
+  Detects 3 or more phishing-classified emails from the same sender IP within
+  1 hour. A burst of phishing from a single source indicates an active phishing
+  campaign targeting the organization. Only 9 phishing events in 4w baseline —
+  this rule fires rarely, which is correct (low volume, high signal).
+
+# TI Source: Build from data. Intent adapted from Splunk "O365 Threat Intelligence
+#   Suspicious Email Delivered".
+# Flood Check: PASS (9 events Aerizome, 0 Kedaara, 4w window 2026-03-13 to 2026-04-10).
+# References:
+#   - MITRE ATT&CK T1566.001 - Phishing: Spearphishing Attachment (TA0001)
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+    metadata.labels[1]="BARRACUDA" class_name="Email Activity"
+    unmapped.barracuda.%json.payload.recipients[0].taxonomy="phishing"
+  | stats count() as event_count
+      by ig_tenant_id, %ingest.import_rule_name, src_endpoint.ip,
+         unmapped.barracuda.%json.payload.hdr_from,
+         unmapped.barracuda.%json.payload.hdr_to,
+         email.subject,
+         unmapped.barracuda.%json.payload.recipients[0].taxonomy,
+         unmapped.barracuda.%json.payload.recipients[0].action
+  | where(event_count >= 3)
+  | rename(unmapped.barracuda.%json.payload.hdr_from as sender,
+           unmapped.barracuda.%json.payload.hdr_to as recipient,
+           unmapped.barracuda.%json.payload.recipients[0].taxonomy as threat_taxonomy,
+           unmapped.barracuda.%json.payload.recipients[0].action as action,
+           src_endpoint.ip as source_ip)
+
+tags:
+  - techniques.t1566_001.spearphishing_attachment
+
+time_range_s: 3600
+run_frequency_s: 300
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Email Threat"
+    - label: "incident_subtype"
+      value: "Phishing Campaign Burst"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "source_ip"
+    - label: "key_entity"
+      value: "{{source_ip}}"
+
+tests:
+  - name: "Positive - 3 phishing emails from same sender to same recipient"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"phishing","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.hdr_from":"phisher@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"185.220.101.5","email.subject":"Reset your password","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:02:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"phishing","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.hdr_from":"phisher@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"185.220.101.5","email.subject":"Reset your password","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:03:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"phishing","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.hdr_from":"phisher@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"185.220.101.5","email.subject":"Reset your password","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - only 2 phishing emails (below threshold)"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"phishing","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.hdr_from":"phisher@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"185.220.101.5","email.subject":"Reset your password","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:02:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"phishing","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.hdr_from":"phisher@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","src_endpoint.ip":"185.220.101.5","email.subject":"Reset your password","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: false

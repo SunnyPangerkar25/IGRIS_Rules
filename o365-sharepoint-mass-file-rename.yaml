@@ -1,0 +1,118 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Microsoft 365 - SharePoint/OneDrive Mass File Rename (Possible Ransomware Staging)"
+enabled: true
+description: |
+  Detects when a single user renames 50 or more files or folders within a
+  one-hour window in SharePoint or OneDrive. Mass rename activity is a
+  classic indicator of ransomware encrypting files in place (the encryptor
+  renames each file with a new extension), or of an attacker staging data
+  for exfiltration by reorganizing it.
+
+  References:
+  * https://attack.mitre.org/techniques/T1486/
+  * https://attack.mitre.org/techniques/T1565/
+
+# MITRE ATT&CK: T1486 - Data Encrypted for Impact (TA0040 - Impact)
+# OCSF Class: File System Activity (1001)
+# Log Source: O365 SharePoint/OneDrive (ocsf_mapped)
+# Note: Verified 2026-04-08 - FileRenamed/FolderRenamed lands in File System
+# Activity 1001 across all 6 tenants. Per-hour bucket flood check at threshold
+# 50 produced 1 fire fleet-wide over 4 weeks - excellent signal-to-noise.
+severity: High
+
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1] = "O365"
+  class_uid = 1001
+  unmapped.Operation: ("FileRenamed" "FolderRenamed")
+  | stats count() as rename_count
+    by ig_tenant_id, %ingest.import_rule_name, actor.user.email_addr
+  | where(rename_count >= 50)
+  | rename(actor.user.email_addr as actor_user)
+
+tags:
+  - techniques.t1486.data_encrypted_for_impact
+
+time_range_s: 3600
+run_frequency_s: 600
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Impact / Ransomware"
+    - label: "incident_subtype"
+      value: "Mass File Rename - SharePoint/OneDrive (M365)"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "actor_user"
+    - label: "actor_user"
+      value: "{{@alert.results_table.rows[0].actor_user}}"
+
+tests:
+  - name: "Positive - 50 file renames by one user in 1h"
+    now_timestamp: "2026-04-07T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-07T11:25:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:05.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:10.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:15.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:20.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:25.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:30.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:35.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:40.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:45.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:50.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:55.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:05.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:10.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:15.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:20.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:25.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:30.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:35.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:40.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:45.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:50.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:26:55.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:05.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:10.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:15.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:20.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:25.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:30.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:35.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:40.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:45.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:50.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:27:55.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:05.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:10.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:15.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:20.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:25.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:30.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:35.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:40.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:45.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:50.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:28:55.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:29:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:29:05.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+    expected_detection_result: true
+
+  - name: "Negative - only 5 file renames"
+    now_timestamp: "2026-04-07T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-07T11:25:00.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:05.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:10.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:15.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+      {"timestamp":"2026-04-07T11:25:20.000Z","metadata":{"labels":["CLOUD","O365"]},"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event","class_uid":1001,"actor":{"user":{"email_addr":"alice@example.com"}},"unmapped":{"Operation":"FileRenamed"}}
+    expected_detection_result: false

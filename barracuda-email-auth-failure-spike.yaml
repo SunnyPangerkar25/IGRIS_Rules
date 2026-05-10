@@ -1,0 +1,76 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Barracuda EGD - Email Authentication Failure Spike"
+enabled: true
+description: |
+  Detects 5 or more email authentication or reputation failures from a single source
+  IP within 1 hour. Covers SPF failures (no_spf, spf), IP reputation blocks (brts, bbl),
+  and Barracuda email blacklist hits. A spike indicates spoofed or compromised sender
+  infrastructure being used for spam or phishing campaigns.
+
+# TI Source: Build from data.
+# Flood Check: PASS (110 Aerizome, 2 Kedaara over 4w 2026-03-13 to 2026-04-10 — 0.16/hr max).
+# References:
+#   - MITRE ATT&CK T1566.002 - Phishing: Spearphishing Link (TA0001)
+#   - Barracuda EGD reason codes: Knowledge_Base/Schema/Barracuda_EGD_schema.md
+severity: Medium
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+    metadata.labels[1]="BARRACUDA" class_name="Email Activity"
+    status="Failure"
+    (status_code="no_spf" or status_code="spf" or status_code="brts"
+     or status_code="bbl" or status_code="barracuda_email_blacklist")
+  | stats count() as event_count
+      by ig_tenant_id, %ingest.import_rule_name, src_endpoint.ip, status_code,
+         unmapped.barracuda.%json.payload.hdr_from,
+         unmapped.barracuda.%json.payload.hdr_to,
+         unmapped.barracuda.%json.payload.recipients[0].action,
+         unmapped.barracuda.%json.payload.recipients[0].taxonomy,
+         email.subject
+  | where(event_count >= 5)
+  | rename(unmapped.barracuda.%json.payload.hdr_from as sender,
+           unmapped.barracuda.%json.payload.hdr_to as recipient,
+           unmapped.barracuda.%json.payload.recipients[0].action as action,
+           unmapped.barracuda.%json.payload.recipients[0].taxonomy as threat_taxonomy,
+           src_endpoint.ip as source_ip,
+           status_code as failure_reason)
+
+tags:
+  - techniques.t1566_002.spearphishing_link
+
+time_range_s: 3600
+run_frequency_s: 300
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Email Threat"
+    - label: "incident_subtype"
+      value: "Email Authentication Failure Spike"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "source_ip"
+    - label: "key_entity"
+      value: "{{source_ip}}"
+
+tests:
+  - name: "Positive - 5 SPF failures from same source IP to same recipient"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:02:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:03:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:04:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:05:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - only 4 failures (below threshold)"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:02:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:03:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+      {"timestamp":"2026-04-08T12:04:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","status":"Failure","status_code":"no_spf","unmapped.barracuda.%json.payload.hdr_from":"spoofed@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"quarantined","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"45.33.32.156","email.subject":"Important notice","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: false

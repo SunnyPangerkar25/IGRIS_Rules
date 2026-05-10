@@ -1,0 +1,79 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Netskope CASB - High Volume File Upload by User"
+enabled: true
+description: |
+  Detects a single user uploading a large number of files (>=200) or a large
+  total data volume (>=500 MB) to a single cloud application within 1 hour,
+  excluding sanctioned corporate destinations (OneDrive, SharePoint, Outlook,
+  Teams, Edge browser form posts) and vendor telemetry (Avast, Dell, WPS Office).
+
+  Surfaces potential cloud-based data exfiltration to unsanctioned SaaS, GenAI,
+  personal webmail, or file-transfer services. Complements the existing DLP
+  rules (rules #9, #10, #11) by catching volume-based egress that doesn't
+  happen to trigger a DLP policy.
+
+  References:
+  * https://attack.mitre.org/techniques/T1567/002/ (Exfiltration to Cloud Storage)
+  * Sigma: cloud/netskope/ — high-volume upload analogs (adapted)
+
+# MITRE ATT&CK: T1567.002 - Exfiltration to Cloud Storage (TA0010 - Exfiltration)
+# OCSF Class: File Hosting Activity (6006)
+# Log Source: Netskope SASE/CASB (ocsf_mapped)
+# Note: Exclude-list tuned against 7-day cross-tenant flood check (2026-04-09):
+#       Avast/Dell = vendor telemetry, WPS Office = autosave, Edge = browser
+#       form posts, Outlook/OneDrive/SharePoint/Teams = sanctioned corporate.
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1]="NETSKOPE"
+  class_name="File Hosting Activity"
+  activity_name="Upload"
+  not actor.app_name: ("Microsoft Edge" "Microsoft Office 365 OneDrive for Business" "Microsoft Office 365 Sharepoint Online" "Microsoft Office 365 Outlook.com" "Microsoft Teams" "Avast Business" "Dell Technologies" "WPS Office")
+  not actor.app_name=""
+  | stats
+      count() as upload_count,
+      sum(file.size) as bytes_uploaded,
+      countdistinct(file.name) as distinct_files
+    by ig_tenant_id, %ingest.import_rule_name, actor.user.name, actor.app_name, src_endpoint.hostname
+  | where(upload_count >= 200 or bytes_uploaded >= 524288000)
+  | rename(actor.user.name as username, actor.app_name as cloud_app, src_endpoint.hostname as hostname)
+
+tags:
+  - techniques.t1567.002.exfiltration_to_cloud_storage
+
+time_range_s: 3600
+run_frequency_s: 300
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Data Exfiltration"
+    - label: "incident_subtype"
+      value: "Cloud Storage High-Volume Upload"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "username"
+    - label: "username"
+      value: "{{@alert.results_table.rows[0].username}}"
+
+tests:
+  - name: "Positive - user uploads single 600 MB file to ChatGPT"
+    now_timestamp: "2026-04-09T13:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-09T12:10:00.000Z","metadata.labels[1]":"NETSKOPE","class_name":"File Hosting Activity","activity_name":"Upload","actor.user.name":"alice@corp.com","actor.app_name":"ChatGPT","file.name":"customer-list.csv","file.size":629145600,"src_endpoint.hostname":"CORP-LAP-42","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - user uploads small file"
+    now_timestamp: "2026-04-09T13:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-09T12:10:00.000Z","metadata.labels[1]":"NETSKOPE","class_name":"File Hosting Activity","activity_name":"Upload","actor.user.name":"bob@corp.com","actor.app_name":"ChatGPT","file.name":"note.txt","file.size":4096,"src_endpoint.hostname":"CORP-LAP-55","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - excluded sanctioned app (OneDrive) at high volume"
+    now_timestamp: "2026-04-09T13:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-09T12:10:00.000Z","metadata.labels[1]":"NETSKOPE","class_name":"File Hosting Activity","activity_name":"Upload","actor.user.name":"charlie@corp.com","actor.app_name":"Microsoft Office 365 OneDrive for Business","file.name":"project.zip","file.size":1073741824,"src_endpoint.hostname":"CORP-LAP-99","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false

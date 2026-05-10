@@ -1,0 +1,77 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Netskope CASB - High Volume File Download by User"
+enabled: true
+description: |
+  Detects a single user downloading a large number of files (>=1000) or a large
+  total data volume (>=2 GB) from a single cloud application within 1 hour,
+  excluding sanctioned corporate SaaS (OneDrive, SharePoint, Teams, Outlook),
+  developer tooling (Azure DevOps, jetBrains, Figma), and vendor telemetry
+  (Trend Micro, Dell).
+
+  Potential indicators of cloud-based data exfiltration (T1530), insider data
+  staging, or acceptable-use policy violations.
+
+  References:
+  * https://attack.mitre.org/techniques/T1530/ (Data from Cloud Storage)
+  * Sigma: cloud/netskope/ — high-volume download analogs (adapted, Scanner repo)
+
+# MITRE ATT&CK: T1530 - Data from Cloud Storage (TA0009 - Collection)
+# OCSF Class: File Hosting Activity (6006)
+# Log Source: Netskope SASE/CASB (ocsf_mapped)
+# Note: Exclude-list is tuned against 7-day cross-tenant flood check (2026-04-09);
+#       Netflix kept in scope per user policy (acceptable-use signal).
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1]="NETSKOPE"
+  class_name="File Hosting Activity"
+  activity_name="Download"
+  not actor.app_name: ("Microsoft Azure DevOps" "Microsoft Office 365 Outlook.com" "Microsoft Office 365 OneDrive for Business" "Microsoft Office 365 Sharepoint Online" "Microsoft Teams" "Trend Micro" "Dell Technologies" "jetBrains" "Figma")
+  not actor.app_name=""
+  | stats
+      count() as download_count,
+      sum(file.size) as bytes_downloaded,
+      countdistinct(file.name) as distinct_files
+    by ig_tenant_id, %ingest.import_rule_name, actor.user.name, actor.app_name, src_endpoint.hostname
+  | where(download_count >= 1000 or bytes_downloaded >= 2147483648)
+  | rename(actor.user.name as username, actor.app_name as cloud_app, src_endpoint.hostname as hostname)
+
+tags:
+  - techniques.t1530.data_from_cloud_storage
+
+time_range_s: 3600
+run_frequency_s: 300
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Data Exfiltration"
+    - label: "incident_subtype"
+      value: "Cloud Storage High-Volume Download"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "username"
+    - label: "username"
+      value: "{{@alert.results_table.rows[0].username}}"
+
+tests:
+  - name: "Positive - single user downloads >2 GB from one cloud app in one hour"
+    now_timestamp: "2026-04-09T13:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-09T12:10:00.000Z","metadata.labels[1]":"NETSKOPE","class_name":"File Hosting Activity","activity_name":"Download","actor.user.name":"alice@corp.com","actor.app_name":"Anthropic Claude","file.name":"dataset-shard-001.parquet","file.size":3221225472,"src_endpoint.hostname":"CORP-LAP-42","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - user downloads below both thresholds"
+    now_timestamp: "2026-04-09T13:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-09T12:10:00.000Z","metadata.labels[1]":"NETSKOPE","class_name":"File Hosting Activity","activity_name":"Download","actor.user.name":"bob@corp.com","actor.app_name":"Anthropic Claude","file.name":"doc.pdf","file.size":524288,"src_endpoint.hostname":"CORP-LAP-55","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - excluded sanctioned app (OneDrive) even at high volume"
+    now_timestamp: "2026-04-09T13:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-09T12:10:00.000Z","metadata.labels[1]":"NETSKOPE","class_name":"File Hosting Activity","activity_name":"Download","actor.user.name":"charlie@corp.com","actor.app_name":"Microsoft Office 365 OneDrive for Business","file.name":"backup.zip","file.size":10737418240,"src_endpoint.hostname":"CORP-LAP-99","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false

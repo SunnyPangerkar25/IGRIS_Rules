@@ -1,0 +1,108 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Barracuda EGD - Suspicious Attachment Detected"
+enabled: true
+description: |
+  Detects inbound emails carrying attachments with executable, script, macro-enabled,
+  or known-phishing file extensions regardless of Barracuda verdict. Covers classic
+  executables (.exe, .scr, .bat), scripts (.js, .vbs, .ps1), modern phishing vectors
+  (.svg smuggling, .one OneNote, .html smuggling), macro-enabled Office (.docm, .xlsm),
+  and data connection files (.iqy, .slk).
+
+# TI Source: Build from data. Intent adapted from Splunk "Suspicious Email Attachment
+#   Extensions". Extension list updated with 2025-2026 phishing tradecraft (SVG smuggling,
+#   OneNote abuse, HTML smuggling, settingcontent-ms).
+# Flood Check: PASS (195 Aerizome, 155 Kedaara, 4w window 2026-03-13 to 2026-04-10 —
+#   attachments with ANY name, not just dangerous extensions).
+# References:
+#   - MITRE ATT&CK T1566.001 - Phishing: Spearphishing Attachment (TA0001)
+#   - MITRE ATT&CK T1027.006 - HTML Smuggling
+severity: Medium
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+    metadata.labels[1]="BARRACUDA" class_name="Email Activity"
+    (unmapped.barracuda.%json.payload.attachments[0].name:*.exe
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.scr
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.js
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.vbs
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.vbe
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.bat
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.ps1
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.hta
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.cmd
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.lnk
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.iso
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.img
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.wsf
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.msi
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.svg
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.one
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.htm
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.html
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.xll
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.xlam
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.docm
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.xlsm
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.pptm
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.dotm
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.shtml
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.iqy
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.slk
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.url
+     or unmapped.barracuda.%json.payload.attachments[0].name:*.settingcontent-ms)
+  | stats count() as event_count
+      by ig_tenant_id, %ingest.import_rule_name, src_endpoint.ip,
+         unmapped.barracuda.%json.payload.hdr_from,
+         unmapped.barracuda.%json.payload.hdr_to,
+         unmapped.barracuda.%json.payload.attachments[0].name,
+         unmapped.barracuda.%json.payload.attachments[0].md5,
+         unmapped.barracuda.%json.payload.recipients[0].action,
+         unmapped.barracuda.%json.payload.recipients[0].taxonomy,
+         email.subject
+  | where(event_count >= 1)
+  | rename(unmapped.barracuda.%json.payload.hdr_from as sender,
+           unmapped.barracuda.%json.payload.hdr_to as recipient,
+           unmapped.barracuda.%json.payload.attachments[0].name as attachment_name,
+           unmapped.barracuda.%json.payload.attachments[0].md5 as attachment_md5,
+           unmapped.barracuda.%json.payload.recipients[0].action as action,
+           unmapped.barracuda.%json.payload.recipients[0].taxonomy as threat_taxonomy,
+           src_endpoint.ip as source_ip)
+
+tags:
+  - techniques.t1566_001.spearphishing_attachment
+
+time_range_s: 3600
+run_frequency_s: 300
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "Email Threat"
+    - label: "incident_subtype"
+      value: "Suspicious Attachment"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "attachment_name"
+    - label: "key_entity"
+      value: "{{attachment_name}}"
+
+tests:
+  - name: "Positive - email with .exe attachment"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.attachments[0].name":"payload.exe","unmapped.barracuda.%json.payload.attachments[0].md5":"d41d8cd98f00b204e9800998ecf8427e","unmapped.barracuda.%json.payload.hdr_from":"attacker@evil.com","unmapped.barracuda.%json.payload.hdr_to":"victim@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"blocked","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"spam","src_endpoint.ip":"185.220.101.5","email.subject":"Invoice attached","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: true
+
+  - name: "Positive - email with .svg attachment (phishing tradecraft)"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.attachments[0].name":"document.svg","unmapped.barracuda.%json.payload.attachments[0].md5":"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4","unmapped.barracuda.%json.payload.hdr_from":"noreply@trusted-look.com","unmapped.barracuda.%json.payload.hdr_to":"user@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"allowed","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"none","src_endpoint.ip":"104.21.50.100","email.subject":"View shared document","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - email with .pdf attachment (safe extension)"
+    now_timestamp: "2026-04-08T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-04-08T12:01:00.000Z","metadata.labels[1]":"BARRACUDA","class_name":"Email Activity","unmapped.barracuda.%json.payload.attachments[0].name":"report.pdf","unmapped.barracuda.%json.payload.attachments[0].md5":"abcdef1234567890abcdef1234567890","unmapped.barracuda.%json.payload.hdr_from":"colleague@partner.com","unmapped.barracuda.%json.payload.hdr_to":"user@corp.com","unmapped.barracuda.%json.payload.recipients[0].action":"allowed","unmapped.barracuda.%json.payload.recipients[0].taxonomy":"none","src_endpoint.ip":"52.101.225.80","email.subject":"Q1 Report","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"email_activity"}
+    expected_detection_result: false
