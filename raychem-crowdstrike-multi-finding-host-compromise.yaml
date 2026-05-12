@@ -1,0 +1,98 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Raychem_CrowdStrike - Multi-Finding Host Compromise"
+enabled: true
+description: |
+  Fires when a single host triggers 3 or more distinct CrowdStrike Falcon
+  detection titles within a 24-hour window. Catches vertical compromise
+  patterns where one host moves through the kill chain (initial access,
+  execution, persistence, credential access, lateral movement). Each fire is
+  high-fidelity and worth analyst attention. Confirmed false-positive patterns
+  are suppressed at the rule level so legitimate operational activity does
+  not contribute toward the unique-finding count.
+
+# Tenant: Raychem (c4134177-2fae-4a1a-8bb5-c81e997f78e5)
+# MITRE ATT&CK: Multiple - signal is the vertical breadth, not a single technique
+# OCSF Class: Detection Finding (2004)
+# Log Source: CrowdStrike Falcon XDR - Alerts API (ocsf_mapped)
+# TI Source: Build from data - per-host kill-chain breadth correlation
+# Flood Check: 2-week baseline ~3 fires. Expected steady state ~3/week.
+# Note: finding_info.title is NOT in stats-by clause because we countdistinct()
+#       on it. Grouping uses device.name + ig_tenant_id so spread of distinct
+#       findings on one host unifies into one alert.
+# FP Exceptions:
+#   1. Veeam VSS operations on backup servers (RRLHLBKSRV / RRLVEEMBKPSRV /
+#      RRLVSBCKSRV where Veeam.Backup.ManagerGCServer.exe is the offender).
+#   2. IT admin svchost-spawned activity on the SIEM server (RRPLSIEMSRV
+#      where parent process is svchost.exe).
+severity: Critical
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  ig_tenant_id = "c4134177-2fae-4a1a-8bb5-c81e997f78e5"
+  metadata.labels[1] = CROWDSTRIKE
+  and not unmapped.product = "automated-lead"
+  and not unmapped.severity_name = "Low"
+  and not (
+      device.name : (RRLHLBKSRV RRLVEEMBKPSRV RRLVSBCKSRV)
+      and finding_info.title : VolumeShadowSnapshot*
+      and unmapped.filename = "Veeam.Backup.ManagerGCServer.exe"
+  )
+  and not (
+      device.name = "RRPLSIEMSRV"
+      and finding_info.title : "FileSystemTamperFalconSensor*"
+      and unmapped.parent_details.%json.filename = "svchost.exe"
+  )
+  | stats
+      countdistinct(finding_info.title) as unique_findings,
+      count() as total_events
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       device.name
+  | where(unique_findings >= 3)
+  | rename(
+      device.name as hostname
+    )
+
+tags:
+  - techniques.universal.crowdstrike_host_compromise
+
+time_range_s: 86400
+run_frequency_s: 86400
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "EDR Alert"
+    - label: "incident_subtype"
+      value: "CrowdStrike Multi-Finding Host Compromise"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "hostname"
+    - label: "hostname"
+      value: "{{@alert.results_table.rows[0].hostname}}"
+
+tests:
+  - name: "Positive - One host with 3 distinct findings should fire"
+    now_timestamp: "2026-05-11T12:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-11T06:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"PeFileWrittenByIIS","device.name":"RRLNGDCANTEEN","unmapped.severity_name":"High","unmapped.product":"epp","unmapped.filename":"w3wp.exe","unmapped.parent_details.%json.filename":"svchost.exe"}
+      {"timestamp":"2026-05-11T08:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"ScriptWrittenUnderIISTree","device.name":"RRLNGDCANTEEN","unmapped.severity_name":"High","unmapped.product":"epp","unmapped.filename":"w3wp.exe","unmapped.parent_details.%json.filename":"svchost.exe"}
+      {"timestamp":"2026-05-11T10:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"ChromeLoginDataAccessed","device.name":"RRLNGDCANTEEN","unmapped.severity_name":"Medium","unmapped.product":"epp","unmapped.filename":"msedge.exe","unmapped.parent_details.%json.filename":"msedge.exe"}
+    expected_detection_result: true
+
+  - name: "Negative - One host with only 2 distinct findings should not fire"
+    now_timestamp: "2026-05-11T12:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-11T08:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"DCSyncAttempted","device.name":"RRPLDOMAINAZURE","unmapped.severity_name":"Critical","unmapped.product":"epp","unmapped.filename":"lsass.exe","unmapped.parent_details.%json.filename":"wininit.exe"}
+      {"timestamp":"2026-05-11T10:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"GenericBypassUACPrivEsc","device.name":"RRPLDOMAINAZURE","unmapped.severity_name":"High","unmapped.product":"epp","unmapped.filename":"svchost.exe","unmapped.parent_details.%json.filename":"services.exe"}
+    expected_detection_result: false
+
+  - name: "Negative - Veeam suppression drops unique count below threshold"
+    now_timestamp: "2026-05-11T12:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-11T06:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"VolumeShadowSnapshotDeleted","device.name":"RRLHLBKSRV","unmapped.severity_name":"Medium","unmapped.product":"epp","unmapped.filename":"Veeam.Backup.ManagerGCServer.exe","unmapped.parent_details.%json.filename":"Veeam.Backup.Service.exe"}
+      {"timestamp":"2026-05-11T08:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"VolumeShadowSnapshotHidden","device.name":"RRLHLBKSRV","unmapped.severity_name":"Medium","unmapped.product":"epp","unmapped.filename":"Veeam.Backup.ManagerGCServer.exe","unmapped.parent_details.%json.filename":"Veeam.Backup.Service.exe"}
+      {"timestamp":"2026-05-11T10:00:00.000Z","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"detection_finding","metadata.labels[1]":"CROWDSTRIKE","finding_info.title":"HiveCredTheft","device.name":"RRLHLBKSRV","unmapped.severity_name":"Critical","unmapped.product":"epp","unmapped.filename":"reg.exe","unmapped.parent_details.%json.filename":"cmd.exe"}
+    expected_detection_result: false
