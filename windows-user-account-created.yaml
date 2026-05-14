@@ -1,0 +1,87 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Windows - User Account Created"
+enabled: true
+description: |
+  Detects creation of a Windows user account. Triggers atomically on Windows
+  Security EventID 4720 (a user account was created). Every account creation
+  surfaces as an alert for analyst review - intentional alert-on-every-event
+  approach so that single-account backdoor creations that wouldn't trip the
+  multi-account-burst threshold are still visible. For threshold-based
+  detection of post-compromise multi-account creation, see the companion
+  rule for UC#44.
+
+# UC#: 57
+# MITRE ATT&CK: T1136.001 - Create Account: Local Account (TA0003 - Persistence)
+# OCSF Class: Account Change
+# Log Source: Windows Security (ocsf_mapped)
+# TI Source: Splunk Security Content - https://research.splunk.com/endpoint/3fb2e8e3-7bc0-4567-9722-c5ab9f8595eb/
+# UWS Encyclopedia: https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/event.aspx?eventid=4720
+# Existing rule reference (column M / direct overlap on deletion side):
+#   SR#1 'A user account was terminated / deleted' already covers EventID 4726 (account
+#   deletion) atomically. UC#57 was originally scoped to detect both create and delete;
+#   scope narrowed to creation only (4720) to avoid duplicating SR#1.
+# Field positions verified live:
+#   [0]=TargetUserName, [1]=TargetDomainName, [2]=TargetSid,
+#   [3]=SubjectUserSid, [4]=SubjectUserName
+
+severity: Medium
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  ig_tenant_id = "c4134177-2fae-4a1a-8bb5-c81e997f78e5"
+  metadata.labels[1] = "WINDOWS"
+  metadata.event_code = 4720
+  | stats count() as event_count
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       actor.user.name,
+       unmapped.StringInserts.%json[0],
+       unmapped.StringInserts.%json[2],
+       unmapped.StringInserts.%json[4]
+  | where(event_count >= 1)
+  | rename(actor.user.name as created_by_mapped,
+           unmapped.StringInserts.%json[0] as target_user,
+           unmapped.StringInserts.%json[2] as target_sid,
+           unmapped.StringInserts.%json[4] as created_by_raw)
+
+tags:
+  - techniques.t1136.001.t1136_001
+
+time_range_s: 3600
+run_frequency_s: 300
+dedup_window_s: 86400
+debounce: true
+alert_per_row: false
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+      use_for_dedup: false
+    - label: "incident_type"
+      value: "Persistence"
+      use_for_dedup: false
+    - label: "incident_subtype"
+      value: "User Account Created"
+      use_for_dedup: false
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+      use_for_dedup: false
+    - label: "incident_key"
+      value: "target_user"
+      use_for_dedup: false
+    - label: "target_user"
+      value: "{{@alert.results_table.rows[0].target_user}}"
+      use_for_dedup: true
+
+tests:
+  - name: "Positive - User account created"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4720,"actor.user.name":"Administrator","unmapped.StringInserts.%json[0]":"newuser","unmapped.StringInserts.%json[1]":"CORP","unmapped.StringInserts.%json[2]":"S-1-5-21-12345-67890-9999","unmapped.StringInserts.%json[3]":"S-1-5-21-12345-67890-500","unmapped.StringInserts.%json[4]":"Administrator","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - 4726 user deleted (covered by existing SR#1, not this rule)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4726,"actor.user.name":"Administrator","unmapped.StringInserts.%json[0]":"olduser","unmapped.StringInserts.%json[1]":"CORP","unmapped.StringInserts.%json[2]":"S-1-5-21-12345-67890-9998","unmapped.StringInserts.%json[3]":"S-1-5-21-12345-67890-500","unmapped.StringInserts.%json[4]":"Administrator","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false

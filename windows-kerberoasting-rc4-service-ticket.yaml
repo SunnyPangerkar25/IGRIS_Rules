@@ -1,0 +1,111 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Windows - Kerberoasting (RC4 Service Ticket Request)"
+enabled: true
+description: |
+  Detects Kerberoasting attacks via Kerberos Service Ticket (TGS) requests using
+  weak RC4-HMAC encryption. Triggers on Windows Security EventID 4769 where
+  TicketEncryptionType equals 0x17 (RC4-HMAC-MD5) targeting a user-defined
+  service principal. Modern Active Directory negotiates AES (0x12 or 0x11)
+  by default; an RC4 service-ticket request is anomalous and indicates an
+  attacker is requesting offline-crackable tickets for service accounts.
+  Excludes ServiceName 'krbtgt' (TGT renewal requests, not service tickets)
+  and machine-account service principals (ServiceName ending in $) which
+  legitimately receive RC4 for backward compatibility in some environments.
+
+# UC#: 69
+# MITRE ATT&CK: T1558.003 - Steal or Forge Kerberos Tickets: Kerberoasting (TA0006 - Credential Access)
+# OCSF Class: Base Event (4769 unmapped - raw_data path)
+# Log Source: Windows Security (raw)
+# TI Source: SigmaHQ - https://github.com/SigmaHQ/sigma/blob/master/rules/windows/builtin/security/win_security_susp_rc4_kerberos.yml
+# Field positions verified live:
+#   [0]=TargetUserName (requester UPN), [1]=TargetDomainName, [2]=ServiceName,
+#   [3]=ServiceSid, [4]=TicketOptions, [5]=TicketEncryptionType,
+#   [6]=IpAddress (source), [7]=IpPort, [8]=Status
+
+# raw_field_rule: true
+# raw_category: B
+# justification: EventID 4769 (Kerberos service ticket requested) is delivered as Base Event in current Windows OCSF mapping; no OCSF Authentication class mapping exists for 4769 in the ingestion pipeline.
+# affected_event_types: windows.4769
+# migration_target: Authentication (3002) - if Windows ingestion adds 4769 OCSF mapping
+
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1] = "WINDOWS"
+  raw_data.%json.EventID = 4769
+  raw_data.%json.StringInserts[5] = "0x17"
+  not raw_data.%json.StringInserts[2] = "*$"
+  not raw_data.%json.StringInserts[2] = "krbtgt"
+  | stats count() as event_count
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       raw_data.%json.StringInserts[0],
+       raw_data.%json.StringInserts[2],
+       raw_data.%json.StringInserts[5],
+       raw_data.%json.StringInserts[6]
+  | where(event_count >= 1)
+  | rename(raw_data.%json.StringInserts[0] as username,
+           raw_data.%json.StringInserts[2] as service_name,
+           raw_data.%json.StringInserts[5] as ticket_encryption_type,
+           raw_data.%json.StringInserts[6] as source_ip)
+
+tags:
+  - techniques.t1558.003.t1558_003
+
+time_range_s: 3600
+run_frequency_s: 300
+dedup_window_s: 86400
+debounce: true
+alert_per_row: false
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+      use_for_dedup: false
+    - label: "incident_type"
+      value: "Credential Access"
+      use_for_dedup: false
+    - label: "incident_subtype"
+      value: "Kerberoasting (RC4 Service Ticket)"
+      use_for_dedup: false
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+      use_for_dedup: false
+    - label: "incident_key"
+      value: "username"
+      use_for_dedup: false
+    - label: "username"
+      value: "{{@alert.results_table.rows[0].username}}"
+      use_for_dedup: true
+
+tests:
+  - name: "Positive - 4769 with RC4 (0x17) targeting user-defined SPN"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4769,"raw_data.%json.StringInserts[0]":"attacker@CORP.LOCAL","raw_data.%json.StringInserts[1]":"CORP.LOCAL","raw_data.%json.StringInserts[2]":"MSSQL_SVC","raw_data.%json.StringInserts[3]":"S-1-5-21-12345-67890-1234","raw_data.%json.StringInserts[4]":"0x40810000","raw_data.%json.StringInserts[5]":"0x17","raw_data.%json.StringInserts[6]":"172.16.110.31","raw_data.%json.StringInserts[7]":54385,"raw_data.%json.StringInserts[8]":"0x0","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Positive - 4769 RC4 with different TicketOptions bitmap (0x60810010)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:02:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4769,"raw_data.%json.StringInserts[0]":"attacker2@CORP.LOCAL","raw_data.%json.StringInserts[1]":"CORP.LOCAL","raw_data.%json.StringInserts[2]":"SQLService","raw_data.%json.StringInserts[3]":"S-1-5-21-12345-67890-1240","raw_data.%json.StringInserts[4]":"0x60810010","raw_data.%json.StringInserts[5]":"0x17","raw_data.%json.StringInserts[6]":"172.16.110.32","raw_data.%json.StringInserts[7]":54388,"raw_data.%json.StringInserts[8]":"0x0","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - 4769 with AES256 encryption (0x12, normal traffic)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4769,"raw_data.%json.StringInserts[0]":"jdoe@CORP.LOCAL","raw_data.%json.StringInserts[1]":"CORP.LOCAL","raw_data.%json.StringInserts[2]":"HOST/server01","raw_data.%json.StringInserts[3]":"S-1-5-21-12345-67890-1235","raw_data.%json.StringInserts[4]":"0x40810000","raw_data.%json.StringInserts[5]":"0x12","raw_data.%json.StringInserts[6]":"172.16.110.31","raw_data.%json.StringInserts[7]":54386,"raw_data.%json.StringInserts[8]":"0x0","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - 4769 RC4 to machine account (excluded by $ suffix)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4769,"raw_data.%json.StringInserts[0]":"DC01$@CORP.LOCAL","raw_data.%json.StringInserts[1]":"CORP.LOCAL","raw_data.%json.StringInserts[2]":"OLDDC$","raw_data.%json.StringInserts[3]":"S-1-5-21-12345-67890-1236","raw_data.%json.StringInserts[4]":"0x40810000","raw_data.%json.StringInserts[5]":"0x17","raw_data.%json.StringInserts[6]":"172.16.110.31","raw_data.%json.StringInserts[7]":54387,"raw_data.%json.StringInserts[8]":"0x0","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - 4769 RC4 to krbtgt (TGT renewal, not Kerberoasting)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4769,"raw_data.%json.StringInserts[0]":"Santosh.b@CORP.LOCAL","raw_data.%json.StringInserts[1]":"CORP.LOCAL","raw_data.%json.StringInserts[2]":"krbtgt","raw_data.%json.StringInserts[3]":"S-1-5-21-12345-67890-502","raw_data.%json.StringInserts[4]":"0x60810010","raw_data.%json.StringInserts[5]":"0x17","raw_data.%json.StringInserts[6]":"172.16.110.31","raw_data.%json.StringInserts[7]":54389,"raw_data.%json.StringInserts[8]":"0x0","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false

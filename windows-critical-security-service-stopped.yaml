@@ -1,0 +1,154 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Windows - Critical Security/Backup Service Stopped or Disabled"
+enabled: true
+description: |
+  Detects critical security or backup services being stopped (EventID 7036) or
+  having their start type changed to Disabled (EventID 7040). For 7036
+  (transient stop), triggers when the ServiceName matches known security
+  vendor agents (Windows Defender, CrowdStrike Falcon, SentinelOne, Sophos,
+  McAfee, Symantec, Trend Micro, Carbon Black) or the Windows Event Log
+  service. Volume Shadow Copy is intentionally excluded from 7036 monitoring
+  because it is an on-demand service that legitimately stops after each
+  backup operation. For 7040 (start-type permanently set to Disabled), the
+  full critical-service list applies including VSS and backup services -
+  permanently disabling these is a strong pre-ransomware indicator.
+
+# UC#: 53
+# MITRE ATT&CK: T1562.001 - Impair Defenses: Disable or Modify Tools (TA0005 - Defense Evasion)
+# OCSF Class: Base Event (7036/7040 unmapped - raw_data path)
+# Log Source: Windows System (raw)
+# TI Source: Splunk Security Content - https://research.splunk.com/endpoint/9c24aef6-cad9-4931-acce-74318aa5663b/
+# UWS Encyclopedia: https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/event.aspx?eventid=7036
+# Field positions verified live:
+#   7036: [0]=ServiceName, [1]=State ("running"/"stopped"), [2]=encoded-internal
+#   7040: [0]=ServiceName, [1]=OldStartType, [2]=NewStartType ("disabled"), [3]=ServiceShortName
+
+# raw_field_rule: true
+# raw_category: B
+# justification: EventIDs 7036 and 7040 (System log service control events) are delivered as Base Event in current Windows OCSF mapping; no OCSF mapping class exists for service-control events in the ingestion pipeline.
+# affected_event_types: windows.7036, windows.7040
+# migration_target: unknown - no OCSF class currently maps service control events
+
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1] = "WINDOWS"
+  ((raw_data.%json.EventID = 7036 AND
+    raw_data.%json.StringInserts[1] = "stopped" AND
+    (raw_data.%json.StringInserts[0]: "Defender" OR
+     raw_data.%json.StringInserts[0]: "WinDefend" OR
+     raw_data.%json.StringInserts[0]: "Sense" OR
+     raw_data.%json.StringInserts[0]: "Mpsvc" OR
+     raw_data.%json.StringInserts[0]: "CrowdStrike" OR
+     raw_data.%json.StringInserts[0]: "CSAgent" OR
+     raw_data.%json.StringInserts[0]: "CSFalconService" OR
+     raw_data.%json.StringInserts[0]: "SentinelAgent" OR
+     raw_data.%json.StringInserts[0]: "SentinelOne" OR
+     raw_data.%json.StringInserts[0]: "Sophos" OR
+     raw_data.%json.StringInserts[0]: "McAfee" OR
+     raw_data.%json.StringInserts[0]: "mfemms" OR
+     raw_data.%json.StringInserts[0]: "Symantec" OR
+     raw_data.%json.StringInserts[0]: "Trend Micro" OR
+     raw_data.%json.StringInserts[0]: "ds_agent" OR
+     raw_data.%json.StringInserts[0]: "Carbon Black" OR
+     raw_data.%json.StringInserts[0]: "cbsensor" OR
+     raw_data.%json.StringInserts[0] = "Windows Event Log"))
+   OR
+   (raw_data.%json.EventID = 7040 AND
+    raw_data.%json.StringInserts[2]: "disabled" AND
+    (raw_data.%json.StringInserts[0]: "Defender" OR
+     raw_data.%json.StringInserts[0]: "WinDefend" OR
+     raw_data.%json.StringInserts[0]: "Sense" OR
+     raw_data.%json.StringInserts[0]: "Mpsvc" OR
+     raw_data.%json.StringInserts[0]: "CrowdStrike" OR
+     raw_data.%json.StringInserts[0]: "CSAgent" OR
+     raw_data.%json.StringInserts[0]: "CSFalconService" OR
+     raw_data.%json.StringInserts[0]: "SentinelAgent" OR
+     raw_data.%json.StringInserts[0]: "SentinelOne" OR
+     raw_data.%json.StringInserts[0]: "Sophos" OR
+     raw_data.%json.StringInserts[0]: "McAfee" OR
+     raw_data.%json.StringInserts[0]: "mfemms" OR
+     raw_data.%json.StringInserts[0]: "Symantec" OR
+     raw_data.%json.StringInserts[0]: "Trend Micro" OR
+     raw_data.%json.StringInserts[0]: "ds_agent" OR
+     raw_data.%json.StringInserts[0]: "Carbon Black" OR
+     raw_data.%json.StringInserts[0]: "cbsensor" OR
+     raw_data.%json.StringInserts[0] = "Volume Shadow Copy" OR
+     raw_data.%json.StringInserts[0]: "Backup Exec" OR
+     raw_data.%json.StringInserts[0]: "Veeam" OR
+     raw_data.%json.StringInserts[0] = "Windows Event Log")))
+  | stats count() as event_count
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       raw_data.%json.EventID,
+       raw_data.%json.Computer,
+       raw_data.%json.StringInserts[0],
+       raw_data.%json.StringInserts[1],
+       raw_data.%json.StringInserts[2]
+  | where(event_count >= 1)
+  | rename(raw_data.%json.EventID as event_id,
+           raw_data.%json.Computer as hostname,
+           raw_data.%json.StringInserts[0] as service_name,
+           raw_data.%json.StringInserts[1] as service_state_or_oldstart,
+           raw_data.%json.StringInserts[2] as service_newstart_or_encoded)
+
+tags:
+  - techniques.t1562.001.t1562_001
+
+time_range_s: 3600
+run_frequency_s: 300
+dedup_window_s: 86400
+debounce: true
+alert_per_row: false
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+      use_for_dedup: false
+    - label: "incident_type"
+      value: "Defense Evasion"
+      use_for_dedup: false
+    - label: "incident_subtype"
+      value: "Critical Security Service Stop/Disable"
+      use_for_dedup: false
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+      use_for_dedup: false
+    - label: "incident_key"
+      value: "service_name"
+      use_for_dedup: false
+    - label: "service_name"
+      value: "{{@alert.results_table.rows[0].service_name}}"
+      use_for_dedup: true
+
+tests:
+  - name: "Positive - 7036 Windows Defender service stopped"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":7036,"raw_data.%json.Computer":"CORP-WS01","raw_data.%json.StringInserts[0]":"Windows Defender Antivirus Service","raw_data.%json.StringInserts[1]":"stopped","raw_data.%json.StringInserts[2]":"WinDefend/1","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Positive - 7040 CrowdStrike service start type changed to disabled"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:02:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":7040,"raw_data.%json.Computer":"CORP-WS02","raw_data.%json.StringInserts[0]":"CrowdStrike Falcon Sensor Service","raw_data.%json.StringInserts[1]":"auto start","raw_data.%json.StringInserts[2]":"disabled","raw_data.%json.StringInserts[3]":"CSFalconService","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - 7036 non-critical service stopped (BITS)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":7036,"raw_data.%json.Computer":"CORP-WS01","raw_data.%json.StringInserts[0]":"Background Intelligent Transfer Service","raw_data.%json.StringInserts[1]":"stopped","raw_data.%json.StringInserts[2]":"BITS/4","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - 7036 critical service running (not stopped)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":7036,"raw_data.%json.Computer":"CORP-WS01","raw_data.%json.StringInserts[0]":"Windows Defender Antivirus Service","raw_data.%json.StringInserts[1]":"running","raw_data.%json.StringInserts[2]":"WinDefend/4","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - 7040 critical service changed to auto-start (not disabled)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":7040,"raw_data.%json.Computer":"CORP-WS01","raw_data.%json.StringInserts[0]":"Veeam Backup Service","raw_data.%json.StringInserts[1]":"demand start","raw_data.%json.StringInserts[2]":"auto start","raw_data.%json.StringInserts[3]":"VeeamBackupSvc","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false

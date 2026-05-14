@@ -1,0 +1,89 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Windows - Failed Logon Attempt to Disabled Account"
+enabled: true
+description: |
+  Detects failed logon attempts against accounts that have been disabled. Triggers
+  on Windows Security EventID 4625 (failed logon) where SubStatus equals
+  0xC0000072 (User logon to account disabled by administrator). Indicates an
+  actor attempting to authenticate using credentials for a deliberately-disabled
+  account - characteristic of persistence checks against known-disabled accounts
+  by an attacker who has prior knowledge of credentials but does not know the
+  account state. Excludes computer accounts (TargetUserName ending in $) and
+  NULL SID subjects to reduce noise from benign system probing.
+
+# UC#: 68
+# MITRE ATT&CK: T1078 - Valid Accounts (TA0001 - Initial Access / TA0003 - Persistence)
+# OCSF Class: Authentication (3002)
+# Log Source: Windows Security (ocsf_mapped)
+# TI Source: SigmaHQ - https://github.com/SigmaHQ/sigma/blob/master/rules/windows/builtin/security/win_security_susp_failed_logon_reasons.yml
+# Field positions verified live:
+#   [0]=SubjectUserSid, [1]=SubjectUserName, [5]=TargetUserName, [6]=TargetDomainName,
+#   [7]=Status, [8]=FailureReason, [9]=SubStatus, [10]=LogonType
+
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1] = "WINDOWS"
+  metadata.event_code = 4625
+  unmapped.StringInserts.%json[9] = "0xC0000072"
+  not unmapped.StringInserts.%json[0] = "S-1-0-0"
+  not unmapped.StringInserts.%json[5] = "*$"
+  | stats count() as event_count
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       src_endpoint.ip,
+       unmapped.StringInserts.%json[5],
+       unmapped.StringInserts.%json[9]
+  | where(event_count >= 1)
+  | rename(src_endpoint.ip as source_ip,
+           unmapped.StringInserts.%json[5] as target_user,
+           unmapped.StringInserts.%json[9] as sub_status)
+
+tags:
+  - techniques.t1078.t1078
+
+time_range_s: 3600
+run_frequency_s: 300
+dedup_window_s: 86400
+debounce: true
+alert_per_row: false
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+      use_for_dedup: false
+    - label: "incident_type"
+      value: "Persistence"
+      use_for_dedup: false
+    - label: "incident_subtype"
+      value: "Logon Attempt to Disabled Account"
+      use_for_dedup: false
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+      use_for_dedup: false
+    - label: "incident_key"
+      value: "target_user"
+      use_for_dedup: false
+    - label: "target_user"
+      value: "{{@alert.results_table.rows[0].target_user}}"
+      use_for_dedup: true
+
+tests:
+  - name: "Positive - 4625 with SubStatus 0xC0000072 (disabled account)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4625,"src_endpoint.ip":"172.16.130.99","unmapped.StringInserts.%json[0]":"S-1-5-21-12345-67890-500","unmapped.StringInserts.%json[5]":"jdoe","unmapped.StringInserts.%json[6]":"CORP","unmapped.StringInserts.%json[7]":"0xc000006e","unmapped.StringInserts.%json[8]":"%%2310","unmapped.StringInserts.%json[9]":"0xC0000072","unmapped.StringInserts.%json[10]":3,"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"authentication"}
+    expected_detection_result: true
+
+  - name: "Negative - 4625 with different SubStatus (0xC000006A bad password)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4625,"src_endpoint.ip":"172.16.130.99","unmapped.StringInserts.%json[0]":"S-1-5-21-12345-67890-500","unmapped.StringInserts.%json[5]":"jdoe","unmapped.StringInserts.%json[6]":"CORP","unmapped.StringInserts.%json[7]":"0xc000006d","unmapped.StringInserts.%json[8]":"%%2313","unmapped.StringInserts.%json[9]":"0xC000006A","unmapped.StringInserts.%json[10]":3,"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"authentication"}
+    expected_detection_result: false
+
+  - name: "Negative - 4625 disabled-account substatus for computer account (excluded by $)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4625,"src_endpoint.ip":"172.16.130.99","unmapped.StringInserts.%json[0]":"S-1-5-21-12345-67890-500","unmapped.StringInserts.%json[5]":"OLDHOST$","unmapped.StringInserts.%json[6]":"CORP","unmapped.StringInserts.%json[7]":"0xc000006e","unmapped.StringInserts.%json[8]":"%%2310","unmapped.StringInserts.%json[9]":"0xC0000072","unmapped.StringInserts.%json[10]":3,"ig_tenant_id":"test-tenant","%ingest.import_rule_name":"authentication"}
+    expected_detection_result: false

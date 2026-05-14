@@ -1,0 +1,117 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Windows - BlackCat Ransomware Indicators"
+enabled: true
+description: |
+  Detects BlackCat (ALPHV) ransomware encryptor invocation via process creation
+  command-line markers documented in CISA Advisory AA23-353A. The encryptor
+  binary requires an --access-token argument to run and uses additional
+  BlackCat-specific arguments (--child for self-spawn, --paths for encryption
+  scope, --propagated for lateral propagation mode, -no-prop / -prop-servers).
+  Triggers on EventID 4688 when --access-token appears together with at least
+  one secondary BlackCat-specific argument, reducing FPs from generic CLI tools
+  (gh, az, gcloud) that also use --access-token in legitimate contexts.
+
+# UC#: 5
+# poc_build: true
+# primary_platform: CrowdStrike Falcon EDR
+# reason: EDR provides behavioral ransomware detection (file-rename rate, shadow-copy deletion,
+#   encryption indicators) that 4688 alone cannot replicate. Built here because logging is
+#   available - re-evaluate post-POC.
+# raw_field_rule: true
+# raw_field_reason: 4688 is Category B (Windows partial OCSF mapping; process-creation events
+#   not OCSF-mapped).
+# MITRE ATT&CK: T1486 - Data Encrypted for Impact (TA0040 - Impact)
+# Log Source: Windows Security (ocsf_mapped via raw_data path - Category B raw-field rule)
+# TI Source: CISA Cybersecurity Advisory AA23-353A - https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-353a
+# UWS Encyclopedia: https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/event.aspx?eventid=4688
+# Field positions verified live:
+#   [1]=SubjectUserName, [5]=NewProcessName, [8]=CommandLine, [10]=TargetUserName,
+#   [13]=ParentProcessName
+# Excluded from rule scope:
+#   - .alphv file extension creation - requires file/object event coverage not available
+#     in 4688. Detect via EDR file-create telemetry instead.
+#   - aadmin account creation - 4720 atomic creation is covered by a separate account-create
+#     rule; no need to duplicate signal here.
+#   - Generic ransomware behaviors (vssadmin/bcdedit/wevtutil) - intentionally excluded
+#     due to overlap with legitimate backup/admin activity.
+
+severity: Critical
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1] = "WINDOWS"
+  raw_data.%json.EventID = 4688
+  raw_data.%json.StringInserts[8] = "*--access-token*"
+  (raw_data.%json.StringInserts[8] = "*--child*"
+   OR raw_data.%json.StringInserts[8] = "*--paths*"
+   OR raw_data.%json.StringInserts[8] = "*--propagated*"
+   OR raw_data.%json.StringInserts[8] = "*-prop-servers*"
+   OR raw_data.%json.StringInserts[8] = "*--no-prop*")
+  | stats count() as event_count
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       raw_data.%json.hostname,
+       raw_data.%json.StringInserts[1],
+       raw_data.%json.StringInserts[5],
+       raw_data.%json.StringInserts[8],
+       raw_data.%json.StringInserts[13]
+  | where(event_count >= 1)
+  | rename(raw_data.%json.hostname as hostname,
+           raw_data.%json.StringInserts[1] as subject_user,
+           raw_data.%json.StringInserts[5] as new_process_name,
+           raw_data.%json.StringInserts[8] as command_line,
+           raw_data.%json.StringInserts[13] as parent_process_name)
+
+tags:
+  - techniques.t1486.t1486
+
+time_range_s: 3600
+run_frequency_s: 300
+dedup_window_s: 86400
+debounce: true
+alert_per_row: false
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+      use_for_dedup: false
+    - label: "incident_type"
+      value: "Impact"
+      use_for_dedup: false
+    - label: "incident_subtype"
+      value: "BlackCat Ransomware Encryptor Invocation"
+      use_for_dedup: false
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+      use_for_dedup: false
+    - label: "incident_key"
+      value: "hostname"
+      use_for_dedup: false
+    - label: "hostname"
+      value: "{{@alert.results_table.rows[0].hostname}}"
+      use_for_dedup: true
+
+tests:
+  - name: "Positive - BlackCat encryptor with --access-token and --child"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4688,"raw_data.%json.hostname":"HOST01","raw_data.%json.StringInserts[1]":"admin","raw_data.%json.StringInserts[5]":"C:\\ProgramData\\svc.exe","raw_data.%json.StringInserts[8]":"C:\\ProgramData\\svc.exe --access-token 1a2b3c4d5e6f --child","raw_data.%json.StringInserts[13]":"C:\\Windows\\System32\\cmd.exe","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Positive - BlackCat encryptor with --access-token and --propagated"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4688,"raw_data.%json.hostname":"HOST02","raw_data.%json.StringInserts[1]":"admin","raw_data.%json.StringInserts[5]":"C:\\Users\\Public\\alphv.exe","raw_data.%json.StringInserts[8]":"alphv.exe --access-token deadbeef --propagated --paths C:\\","raw_data.%json.StringInserts[13]":"C:\\Windows\\System32\\cmd.exe","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - gh CLI with --access-token only (no BlackCat secondary args)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4688,"raw_data.%json.hostname":"DEVBOX","raw_data.%json.StringInserts[1]":"developer","raw_data.%json.StringInserts[5]":"C:\\Program Files\\GitHub CLI\\gh.exe","raw_data.%json.StringInserts[8]":"gh auth login --access-token ghp_xxxxxxxxxxxxx","raw_data.%json.StringInserts[13]":"C:\\Windows\\System32\\cmd.exe","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - Chromium renderer with --child only (no --access-token)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4688,"raw_data.%json.hostname":"DEVBOX","raw_data.%json.StringInserts[1]":"developer","raw_data.%json.StringInserts[5]":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe","raw_data.%json.StringInserts[8]":"chrome.exe --type=renderer --child","raw_data.%json.StringInserts[13]":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false

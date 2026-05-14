@@ -1,0 +1,107 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Windows - AD Object WriteDAC Access"
+enabled: true
+description: |
+  Detects Write Discretionary Access Control (WriteDAC) operations on Active Directory
+  objects via Windows Security EventID 4662 on ObjectServer=DS. Triggers on any
+  AccessMask that includes the WriteDAC bit (0x40000) - covering pure WriteDAC
+  (0x40000), the common WriteDAC+WriteOwner attack pattern (0xc0000),
+  STANDARD_RIGHTS_REQUIRED (0xf0000), and STANDARD_RIGHTS_ALL (0x1f0000). WriteDAC
+  allows an actor to modify the ACL of the target AD object - commonly abused to
+  grant persistent permissions on sensitive objects (domain root, privileged groups,
+  AdminSDHolder, computer accounts) and establish Active Directory persistence
+  backdoors.
+
+# UC#: 12
+# MITRE ATT&CK: T1222.001 - Windows File and Directory Permissions Modification (TA0005 - Defense Evasion)
+# OCSF Class: Entity Management / DS Object Access
+# Log Source: Windows Security (ocsf_mapped)
+# TI Source: SigmaHQ - https://github.com/SigmaHQ/sigma/blob/master/rules/windows/builtin/security/win_security_ad_object_writedac_access.yml
+# Field positions (StringInserts) verified:
+#   [0]=SubjectUserSid, [1]=SubjectUserName, [2]=SubjectDomainName, [3]=SubjectLogonId,
+#   [4]=ObjectServer, [5]=ObjectType (class GUID), [6]=ObjectName (target object GUID/DN),
+#   [7]=OperationType, [8]=HandleId, [9]=AccessList, [10]=AccessMask, [11]=Properties
+
+severity: Critical
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.labels[1] = "WINDOWS"
+  metadata.event_code = 4662
+  unmapped.StringInserts.%json[4] = "DS"
+  (unmapped.StringInserts.%json[10] = "0x40000" or
+   unmapped.StringInserts.%json[10] = "0xc0000" or
+   unmapped.StringInserts.%json[10] = "0xf0000" or
+   unmapped.StringInserts.%json[10] = "0x1f0000")
+  | stats count() as event_count
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       actor.user.name,
+       unmapped.StringInserts.%json[4],
+       unmapped.StringInserts.%json[6],
+       unmapped.StringInserts.%json[10]
+  | where(event_count >= 1)
+  | rename(actor.user.name as username,
+           unmapped.StringInserts.%json[4] as object_server,
+           unmapped.StringInserts.%json[6] as object_name,
+           unmapped.StringInserts.%json[10] as access_mask)
+
+tags:
+  - techniques.t1222.001.t1222_001
+
+time_range_s: 3600
+run_frequency_s: 300
+dedup_window_s: 86400
+debounce: true
+alert_per_row: false
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+      use_for_dedup: false
+    - label: "incident_type"
+      value: "Defense Evasion"
+      use_for_dedup: false
+    - label: "incident_subtype"
+      value: "AD Object Permission Modification (WriteDAC)"
+      use_for_dedup: false
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+      use_for_dedup: false
+    - label: "incident_key"
+      value: "username"
+      use_for_dedup: false
+    - label: "username"
+      value: "{{@alert.results_table.rows[0].username}}"
+      use_for_dedup: true
+
+tests:
+  - name: "Positive - WriteDAC alone (AccessMask 0x40000) on AD object"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4662,"actor.user.name":"attacker","unmapped.StringInserts.%json[4]":"DS","unmapped.StringInserts.%json[5]":"%{19195a5b-6da0-11d0-afd3-00c04fd930c9}","unmapped.StringInserts.%json[6]":"CN=AdminSDHolder,CN=System,DC=corp,DC=local","unmapped.StringInserts.%json[7]":"Object Access","unmapped.StringInserts.%json[10]":"0x40000","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Positive - WriteDAC + WriteOwner combined (AccessMask 0xc0000) - BloodHound pattern"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:02:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4662,"actor.user.name":"compromised-svc","unmapped.StringInserts.%json[4]":"DS","unmapped.StringInserts.%json[5]":"%{bf967a86-0de6-11d0-a285-00aa003049e2}","unmapped.StringInserts.%json[6]":"CN=Domain Admins,CN=Users,DC=corp,DC=local","unmapped.StringInserts.%json[7]":"Object Access","unmapped.StringInserts.%json[10]":"0xc0000","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - 4662 with non-WriteDAC AccessMask (0x0 read access)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4662,"actor.user.name":"normaluser","unmapped.StringInserts.%json[4]":"DS","unmapped.StringInserts.%json[5]":"%{bf967a86-0de6-11d0-a285-00aa003049e2}","unmapped.StringInserts.%json[6]":"CN=SomeUser,CN=Users,DC=corp,DC=local","unmapped.StringInserts.%json[7]":"Object Access","unmapped.StringInserts.%json[10]":"0x0","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - 4662 with WriteDAC but non-DS ObjectServer (file system)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4662,"actor.user.name":"normaluser","unmapped.StringInserts.%json[4]":"Security","unmapped.StringInserts.%json[5]":"File","unmapped.StringInserts.%json[6]":"C:\\some\\file.txt","unmapped.StringInserts.%json[7]":"Object Access","unmapped.StringInserts.%json[10]":"0x40000","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
+
+  - name: "Negative - 4662 DS with non-WriteDAC ControlAccess (0x100)"
+    now_timestamp: "2026-05-13T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-05-13T12:01:00.000Z","metadata.labels[1]":"WINDOWS","metadata.event_code":4662,"actor.user.name":"normaluser","unmapped.StringInserts.%json[4]":"DS","unmapped.StringInserts.%json[5]":"%{bf967a86-0de6-11d0-a285-00aa003049e2}","unmapped.StringInserts.%json[6]":"CN=SomeUser,CN=Users,DC=corp,DC=local","unmapped.StringInserts.%json[7]":"Object Access","unmapped.StringInserts.%json[10]":"0x100","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
