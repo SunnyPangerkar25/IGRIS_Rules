@@ -1,0 +1,94 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "Windows - Member Removed from Privileged Global Group (4729)"
+enabled: true
+description: |
+  Detects a member being removed from a high-privilege security-enabled global
+  group (Domain Admins). Fires on a single occurrence. Removal from Domain Admins
+  can be legitimate administration, but is also used to cover tracks after misuse
+  or to disrupt response, so privileged-group removals warrant review.
+
+# MITRE ATT&CK: T1098 - Account Manipulation (TA0003 - Persistence, TA0004 - Privilege Escalation)
+# MITRE ATT&CK: T1531 - Account Access Removal (TA0040 - Impact)
+# OCSF Class: Base Event (0) - unmapped Windows feed
+# Log Source: Windows Security (ocsf_mapped, raw_data.%json.* feed)
+# TI Source: Build from data + Microsoft Security Auditing schema (UWS Encyclopedia)
+# Reference: https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/event.aspx?eventid=4729
+#
+# Event 4729 = member removed from a security-enabled GLOBAL group.
+# Critical global group: Domain Admins = RID 512, matched on the well-known RID (domain-agnostic).
+#   RIDs below 1000 are reserved well-known values, so a custom group can never collide with 512.
+# Field positions (raw_data.%json.StringInserts) - 472x/475x family:
+#   [0]=MemberName(DN)  [1]=MemberSid  [2]=TargetGroupName  [3]=TargetDomainName
+#   [4]=TargetGroupSid  [5]=SubjectUserSid  [6]=SubjectUserName(performed_by)  (verified: [2]=group, [4]=SID)
+#
+# Per-rule exceptions: add `and not (...)` clauses to the filter block for authorized accounts.
+#
+# raw_field_rule: true
+# raw_category: B
+# justification: Windows EventID 4729 arrives as Base Event in the current Windows OCSF mapping; EventID, target group name and group SID are only available via raw_data.%json paths
+# affected_event_types: windows.4729
+# migration_target: Entity Management / Group Management - if Windows gains full OCSF support
+severity: Critical
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  ig_tenant_id = "c4134177-2fae-4a1a-8bb5-c81e997f78e5"
+  metadata.labels[1] = "WINDOWS"
+  raw_data.%json.EventID = 4729
+  raw_data.%json.StringInserts[4]: "-512"
+  | stats count() as event_count
+    by ig_tenant_id,
+       %ingest.import_rule_name,
+       raw_data.%json.Computer,
+       raw_data.%json.StringInserts[2],
+       raw_data.%json.StringInserts[4],
+       raw_data.%json.StringInserts[0],
+       raw_data.%json.StringInserts[6]
+  | where(event_count >= 1)
+  | rename(raw_data.%json.Computer as hostname,
+           raw_data.%json.StringInserts[2] as group_name,
+           raw_data.%json.StringInserts[4] as group_sid,
+           raw_data.%json.StringInserts[0] as member,
+           raw_data.%json.StringInserts[6] as performed_by)
+
+tags:
+  - techniques.t1098.t1098
+
+time_range_s: 3600
+run_frequency_s: 300
+dedup_window_s: 3600
+debounce: true
+alert_per_row: false
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+      use_for_dedup: false
+    - label: "incident_type"
+      value: "Privilege Escalation"
+      use_for_dedup: false
+    - label: "incident_subtype"
+      value: "Member Removed from Privileged Global Group (Domain Admins)"
+      use_for_dedup: false
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+      use_for_dedup: false
+    - label: "incident_key"
+      value: "member"
+      use_for_dedup: false
+    - label: "member"
+      value: "{{@alert.results_table.rows[0].member}}"
+      use_for_dedup: true
+
+tests:
+  - name: "Positive - member removed from Domain Admins (4729, -512)"
+    now_timestamp: "2026-06-03T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-06-03T12:01:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4729,"raw_data.%json.Computer":"DC01.example.local","raw_data.%json.StringInserts[0]":"CN=Former Admin,OU=Users,DC=example,DC=local","raw_data.%json.StringInserts[1]":"S-1-5-21-264163316-3204977826-1206970977-1200","raw_data.%json.StringInserts[2]":"Domain Admins","raw_data.%json.StringInserts[3]":"EXAMPLE","raw_data.%json.StringInserts[4]":"S-1-5-21-264163316-3204977826-1206970977-512","raw_data.%json.StringInserts[6]":"admin.user","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: true
+
+  - name: "Negative - member removed from non-critical global group (custom RID)"
+    now_timestamp: "2026-06-03T12:15:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-06-03T12:02:00.000Z","metadata.labels[1]":"WINDOWS","raw_data.%json.EventID":4729,"raw_data.%json.Computer":"DC01.example.local","raw_data.%json.StringInserts[0]":"CN=Normal User,OU=Users,DC=example,DC=local","raw_data.%json.StringInserts[1]":"S-1-5-21-264163316-3204977826-1206970977-1500","raw_data.%json.StringInserts[2]":"Raychem_VPN_Users","raw_data.%json.StringInserts[3]":"EXAMPLE","raw_data.%json.StringInserts[4]":"S-1-5-21-264163316-3204977826-1206970977-12624","raw_data.%json.StringInserts[6]":"it.user","ig_tenant_id":"c4134177-2fae-4a1a-8bb5-c81e997f78e5","%ingest.import_rule_name":"base_event"}
+    expected_detection_result: false
