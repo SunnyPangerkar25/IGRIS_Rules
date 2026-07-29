@@ -1,0 +1,189 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "AWS SageMaker - AI Estate Enumeration by Long-Term Credential"
+enabled: true
+description: |
+  Detects a single identity performing broad discovery against Amazon SageMaker
+  within a one-hour window, on either of two shapes: breadth (listing or describing
+  many distinct SageMaker resource types - notebooks, endpoints, models, training
+  jobs, clusters, model registry) or volume (a high number of SageMaker API calls).
+  Legitimate use touches one or two resource types; an identity that sweeps the
+  whole estate is mapping available ML assets, which is the discovery phase that
+  precedes model theft, notebook takeover, endpoint abuse, or credential harvesting
+  from training artifacts. Fires once per identity per window, reporting the number
+  of distinct operations, total calls, and distinct source IPs.
+
+  References:
+  * https://attack.mitre.org/techniques/T1526/ (Cloud Service Discovery)
+  * https://atlas.mitre.org/techniques/AML.T0007 (Discover ML Artifacts)
+
+# MITRE ATT&CK: T1526 - Cloud Service Discovery (TA0007 - Discovery); T1580 - Cloud Infrastructure Discovery
+# MITRE ATLAS: AML.T0007 - Discover ML Artifacts
+# OCSF Class: API Activity (6003)
+# Log Source: AWS CloudTrail (ocsf_mapped) - sagemaker.amazonaws.com, import_rule_name=api_activity
+# Threat: AI/ML estate reconnaissance - mapping SageMaker assets prior to abuse
+# Tier: 1 (purely AI-specific) - Bucket A (existing logs) - derives from AISDR SM-1
+#
+# --- IDENTITY KEY (revised 2026-07-28) ---
+# incident_key must name a REAL field, so the eval/coalesce-derived `entity_id` was REMOVED, and the
+# single combined rule was SPLIT into this pair so that each variant keys on one identity shape.
+# Verified live against tenant 963f96f3 CloudTrail: actor.user.uid is OCSF-mapped and populated for
+# BOTH identity shapes -
+#     IAMUser     -> "AIDASWUZPRFJGCFUYL4VW"                        (IAM user principalId)
+#     AssumedRole -> "AROASWUZPRFJBFKVM2ROL:user@example.com"       (role principalId : session name)
+# It is stable across STS sessions AND preserves per-human attribution under SSO, which the old
+# coalesce destroyed by collapsing every session of a shared role into one role ARN. That stability
+# is what this rule depends on: a breadth threshold is meaningless if one actor's calls fragment.
+# NOT used as the key, and why:
+#   actor.user.name        - the ROLE name on AssumedRole, and ABSENT entirely on IAMUser.
+#   actor.session.issuer   - NOT mapped for CloudTrail in this tenant (confirmed absent from the
+#                            live column set); referencing it would silently break the rule.
+#
+# --- WHY THE SPLIT USES actor.user.uid AND NOT unmapped.userIdentity.%json.type ---
+# IAM-user principalIds always begin AIDA, role principalIds always begin AROA, and ':' is a token
+# boundary, so `actor.user.uid: AIDA*` / `AROA*` splits the two shapes using a POSITIVE token filter
+# on a MAPPED field. That is cheaper than extracting unmapped.userIdentity.%json.type and avoids the
+# unmapped.* predicate class that has silent-zeroed before. Verified live: `actor.user.uid: AIDA*`
+# returns rows on this tenant.
+#
+# --- AGGREGATE ORDER MATTERS ---
+# where() reliably filters the FIRST stats aggregate, so distinct_ops is emitted first: the breadth
+# branch is the primary signal. The volume branch (event_count) is the second aggregate and is
+# covered by its own positive unit test - if that test fails, split the branches into two rules.
+#
+# --- WHY THIS VARIANT EXISTS ---
+# This variant covers IAM users - long-term access keys. Enumeration of the ML estate by a
+# long-term credential is the higher-severity case: these identities are typically automation with a
+# narrow, fixed job, so broad discovery is off-pattern by definition, and a leaked access key is the
+# usual way an external actor arrives. Severity is High here versus Medium for the assumed-role
+# variant, which carries ordinary human and workload traffic.
+#
+# --- SCOPE AND THRESHOLDS ---
+# No aws-service-role exclusion is used. The thresholds already sit far above every legitimate
+#   actor, which avoids a `not` predicate (a known silent-zero risk) AND correctly still fires if a
+#   service role ever does sweep the estate.
+# All SageMaker operations are counted, not just List*/Describe*. In practice this source is
+#   read-only, so breadth equals enumeration; a burst of distinct write operations is equally notable.
+# Thresholds: distinct_ops >= 5 OR event_count >= 50 per identity per hour - set from measured data
+#   (recon actor peaked at 9 distinct ops / 121 calls in one hour; every benign actor, including all
+#   AWS service-linked roles, peaked at 2 distinct ops / 21 calls). ~2 windows/day across both
+#   variants combined. Re-measure per variant after a week of live running and tune.
+# NOTE: api.operation is countdistinct()'d and therefore must NEVER appear in `stats ... by`.
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.product.feature.name = "sagemaker.amazonaws.com"
+  actor.user.uid: AIDA*
+  | stats
+      countdistinct(api.operation) as distinct_ops,
+      count() as event_count,
+      countdistinct(src_endpoint.ip) as distinct_source_ips
+    by ig_tenant_id, %ingest.import_rule_name,
+       actor.user.uid,
+       unmapped.userIdentity.%json.arn,
+       unmapped.userIdentity.%json.type
+  | where(distinct_ops >= 5 or event_count >= 50)
+  | rename(
+      actor.user.uid as principal_uid,
+      unmapped.userIdentity.%json.arn as principal_arn,
+      unmapped.userIdentity.%json.type as identity_type
+    )
+
+tags:
+  - techniques.t1526.cloud_service_discovery
+  - atlas.aml_t0007.discover_ml_artifacts
+
+time_range_s: 3600
+run_frequency_s: 900
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "AI Estate Reconnaissance"
+    - label: "incident_subtype"
+      value: "SageMaker Broad Resource Enumeration (IAM User)"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "principal_uid"
+    - label: "key_entity"
+      value: "{{principal_uid}}"
+
+tests:
+  - name: "Positive (breadth branch) - identity enumerates 6 distinct SageMaker resource types"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp": "2026-07-17T03:30:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:31:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListEndpoints", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:32:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListModels", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:33:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListTrainingJobs", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:34:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListClusters", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:35:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListModelPackages", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+    expected_detection_result: true
+
+  - name: "Positive (volume branch) - identity makes 52 calls against a single resource type"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp": "2026-07-17T03:30:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:01.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:02.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:03.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:04.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:05.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:06.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:07.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:08.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:09.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:10.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:11.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:12.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:13.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:14.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:15.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:16.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:17.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:18.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:19.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:20.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:21.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:22.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:23.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:24.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:25.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:26.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:27.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:28.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:29.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:30.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:31.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:32.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:33.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:34.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:35.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:36.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:37.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:38.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:39.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:40.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:41.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:42.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:43.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:44.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:45.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:46.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:47.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:48.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:49.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:50.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:30:51.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDAQJOC4V4OA6XENOHAH", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/poller@example.com", "src_endpoint.ip": "203.0.113.20", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - benign actor: 2 distinct resource types, low call volume"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp": "2026-07-17T03:30:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListEndpoints", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:31:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListEndpoints", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:32:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+      {"timestamp": "2026-07-17T03:33:00.000Z", "metadata.product.feature.name": "sagemaker.amazonaws.com", "api.operation": "ListNotebookInstances", "actor.user.uid": "AIDASWUZPRFJGCFUYL4VW", "unmapped.userIdentity.%json.type": "IAMUser", "unmapped.userIdentity.%json.arn": "arn:aws:iam::111122223333:user/analyst@example.com", "src_endpoint.ip": "203.0.113.10", "ig_tenant_id": "test-tenant", "%ingest.import_rule_name": "api_activity"}
+    expected_detection_result: false

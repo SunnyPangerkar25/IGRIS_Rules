@@ -1,0 +1,138 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "AWS SageMaker - Notebook Lifecycle Configuration or Role Modified"
+enabled: true
+description: |
+  Detects creation or modification of an Amazon SageMaker notebook lifecycle
+  configuration, and modification of a notebook instance's attached lifecycle
+  configuration or execution role. Lifecycle configurations are shell scripts that
+  SageMaker runs automatically when a notebook is created or started, and AWS
+  documents that they execute with root access and the notebook instance's IAM
+  execution role privileges. That makes them a durable code-execution and
+  persistence mechanism: a script attached once runs on every subsequent start,
+  under high privilege, with no further attacker interaction. Swapping the execution
+  role on an existing notebook is the equivalent privilege-side change. Fires once
+  per acting identity and action per window.
+
+  References:
+  * https://attack.mitre.org/techniques/T1059/004/ (Command and Scripting Interpreter: Unix Shell)
+  * https://attack.mitre.org/techniques/T1546/ (Event Triggered Execution)
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_CreateNotebookInstanceLifecycleConfig.html
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_UpdateNotebookInstanceLifecycleConfig.html
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_UpdateNotebookInstance.html
+
+# MITRE ATT&CK: T1059.004 - Command and Scripting Interpreter: Unix Shell (TA0002 - Execution);
+#   T1546 - Event Triggered Execution (TA0003 - Persistence)
+# OCSF Class: API Activity (6003)
+# Log Source: AWS CloudTrail (ocsf_mapped) — sagemaker.amazonaws.com, import_rule_name=api_activity
+# Threat: root-level code execution and persistence on ML compute via lifecycle scripts
+# Tier: 1 (purely AI-specific) · Control plane (CloudTrail management events, logged by default)
+# Enablement: NONE — SageMaker management events log by default.
+#
+# --- IDENTITY KEY (revised 2026-07-28) ---
+# incident_key must name a REAL field, so the eval/coalesce-derived `entity_id` was REMOVED.
+# Verified live against tenant 963f96f3 CloudTrail: actor.user.uid is OCSF-mapped and populated for
+# BOTH identity shapes —
+#     IAMUser     -> "AIDASWUZPRFJGCFUYL4VW"                        (IAM user principalId)
+#     AssumedRole -> "AROASWUZPRFJBFKVM2ROL:user@example.com"       (role principalId : session name)
+# It is therefore stable across STS sessions AND preserves per-human attribution under SSO, which the
+# old coalesce destroyed by collapsing every session of a shared role into one role ARN.
+# NOT used as the key, and why:
+#   actor.user.name        - the ROLE name on AssumedRole, and ABSENT entirely on IAMUser.
+#   actor.session.issuer   - NOT mapped for CloudTrail in this tenant (confirmed absent from the
+#                            live column set); referencing it would silently break the rule.
+# The two raw ARNs ride along as context columns (principal_arn, role_arn) for triage.
+#
+# --- FIELD GROUNDING (verified against AWS API Reference) ---
+# CreateNotebookInstanceLifecycleConfig / UpdateNotebookInstanceLifecycleConfig
+#     requestParameters.notebookInstanceLifecycleConfigName   (required, FLAT)
+#         ^ NOTE the FULL-LENGTH name. This is NOT the same field as `lifecycleConfigName`, which is
+#           the (different) field used on the notebook-instance APIs. Confusing the two silently breaks.
+#     requestParameters.onCreate[0].content   (array, max 1 item, base64-encoded shell script)
+#     requestParameters.onStart[0].content    (array, max 1 item, base64-encoded shell script)
+#         ^ AWS API Reference confirms: "The shell script must be a base64-encoded string."
+# UpdateNotebookInstance  (its REAL high-value signals — it has no DirectInternetAccess field)
+#     requestParameters.notebookInstanceName  (required, FLAT)
+#     requestParameters.lifecycleConfigName   (FLAT) — attaching a root-privileged script
+#     requestParameters.roleArn               (FLAT) — swapping to a more privileged role
+#     requestParameters.disassociateLifecycleConfig (boolean)
+#     NOTE: UpdateNotebookInstance returns an empty body, so responseElements is null.
+#
+# --- WHY SCRIPT CONTENT IS NOT USED IN THE TRIGGER ---
+# AWS publishes NO CloudTrail example for these APIs and makes NO statement about whether the
+# lifecycle script content is recorded, truncated, or omitted. The field is also a nested ARRAY
+# (onStart[0].content), which in this tenant requires unmapped.* array-index syntax that has
+# silent-zeroed before, and no lifecycle config has ever existed here to verify it against.
+# The rule therefore triggers on the API call plus principal. If content does turn out to be
+# present, decoding the base64 and scanning for curl/wget/nc/reverse-shell patterns is a valuable
+# ENRICHMENT — but it must never be a dependency, or the rule silently never fires.
+#
+# --- OPTIONAL REFINEMENT (verify against a real event first) ---
+#   unmapped.requestParameters.%json.onStart.%json[0].content
+#
+# FP Exceptions: sanctioned notebook-provisioning pipelines / IaC roles added as `not (...)` lines.
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.product.feature.name = "sagemaker.amazonaws.com"
+  (api.operation = "CreateNotebookInstanceLifecycleConfig" or api.operation = "UpdateNotebookInstanceLifecycleConfig" or api.operation = "UpdateNotebookInstance")
+  | stats
+      count() as event_count,
+      countdistinct(src_endpoint.ip) as distinct_source_ips
+    by ig_tenant_id, %ingest.import_rule_name,
+       actor.user.uid,
+       unmapped.userIdentity.%json.arn,
+       unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn,
+       unmapped.userIdentity.%json.type,
+       api.operation,
+       unmapped.requestParameters.%json.notebookInstanceLifecycleConfigName,
+       unmapped.requestParameters.%json.notebookInstanceName,
+       unmapped.requestParameters.%json.lifecycleConfigName,
+       unmapped.awsRegion
+  | where(event_count >= 1)
+  | rename(
+      actor.user.uid as principal_uid,
+      unmapped.userIdentity.%json.arn as principal_arn,
+      unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn as role_arn,
+      unmapped.userIdentity.%json.type as identity_type,
+      api.operation as event_name,
+      unmapped.requestParameters.%json.notebookInstanceLifecycleConfigName as lifecycle_config_name,
+      unmapped.requestParameters.%json.notebookInstanceName as notebook_name,
+      unmapped.requestParameters.%json.lifecycleConfigName as attached_lifecycle_config,
+      unmapped.awsRegion as aws_region
+    )
+
+tags:
+  - techniques.t1059.command_and_scripting_interpreter
+  - techniques.t1546.event_triggered_execution
+
+time_range_s: 3600
+run_frequency_s: 900
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "AI Infrastructure Persistence"
+    - label: "incident_subtype"
+      value: "SageMaker Notebook Lifecycle Config or Role Modified"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "principal_uid"
+    - label: "key_entity"
+      value: "{{principal_uid}}"
+
+tests:
+  - name: "Positive - lifecycle config created, then attached to a notebook via UpdateNotebookInstance"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"CreateNotebookInstanceLifecycleConfig","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.notebookInstanceLifecycleConfigName":"backdoor-lc","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+      {"timestamp":"2026-07-17T03:35:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"UpdateNotebookInstance","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.notebookInstanceName":"ds-notebook-01","unmapped.requestParameters.%json.lifecycleConfigName":"backdoor-lc","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - lifecycle configs listed/described only"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"ListNotebookInstanceLifecycleConfigs","actor.user.uid":"AROASWUZPRFJBFKVM2ROL:compute-optimizer","unmapped.userIdentity.%json.type":"AssumedRole","unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn":"arn:aws:iam::111122223333:role/aws-service-role/compute-optimizer.amazonaws.com/AWSServiceRoleForComputeOptimizer","unmapped.userIdentity.%json.arn":"arn:aws:sts::111122223333:assumed-role/AWSServiceRoleForComputeOptimizer/session-1","unmapped.awsRegion":"ap-south-1","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: false

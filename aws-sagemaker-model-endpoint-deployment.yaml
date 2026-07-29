@@ -1,0 +1,144 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "AWS SageMaker - Model or Inference Endpoint Deployed or Modified"
+enabled: true
+description: |
+  Detects deployment or modification of an Amazon SageMaker model or inference
+  endpoint. Creating a model registers a container image and an execution role;
+  creating or updating an endpoint configuration and endpoint puts that container
+  into service behind an inference API. An unauthorized change here substitutes the
+  model that answers production requests, introduces an attacker-supplied container
+  image into a privileged execution context, or attaches shell access to the serving
+  container. Because the endpoint update path replaces which configuration is live,
+  a model swap requires no change to the endpoint's name or callers. Fires once per
+  acting identity, action and resource per window.
+
+  References:
+  * https://attack.mitre.org/techniques/T1525/ (Implant Internal Image)
+  * https://atlas.mitre.org/techniques/AML.T0018 (Manipulate AI Model)
+  * https://docs.aws.amazon.com/sagemaker/latest/dg/logging-using-cloudtrail.html
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_CreateModel.html
+
+# MITRE ATT&CK: T1525 - Implant Internal Image (TA0003 - Persistence); T1565 - Data Manipulation
+# MITRE ATLAS: AML.T0018 - Manipulate AI Model
+# OCSF Class: API Activity (6003)
+# Log Source: AWS CloudTrail (ocsf_mapped) — sagemaker.amazonaws.com, import_rule_name=api_activity
+# Threat: unauthorized model deployment / model swap / malicious container into the serving path
+# Tier: 1 (purely AI-specific) · Control plane (CloudTrail management events, logged by default)
+# Enablement: NONE — SageMaker management events log by default.
+#
+# --- IDENTITY KEY (revised 2026-07-28) ---
+# incident_key must name a REAL field, so the eval/coalesce-derived `entity_id` was REMOVED.
+# Verified live against tenant 963f96f3 CloudTrail: actor.user.uid is OCSF-mapped and populated for
+# BOTH identity shapes —
+#     IAMUser     -> "AIDASWUZPRFJGCFUYL4VW"                        (IAM user principalId)
+#     AssumedRole -> "AROASWUZPRFJBFKVM2ROL:user@example.com"       (role principalId : session name)
+# It is therefore stable across STS sessions AND preserves per-human attribution under SSO, which the
+# old coalesce destroyed by collapsing every session of a shared role into one role ARN.
+# NOT used as the key, and why:
+#   actor.user.name        - the ROLE name on AssumedRole, and ABSENT entirely on IAMUser.
+#   actor.session.issuer   - NOT mapped for CloudTrail in this tenant (confirmed absent from the
+#                            live column set); referencing it would silently break the rule.
+# The two raw ARNs ride along as context columns (principal_arn, role_arn) for triage.
+#
+# --- FIELD GROUNDING (CreateModel and CreateEndpoint have REAL AWS-published CloudTrail examples) ---
+# CreateModel — AWS-published CloudTrail example, verbatim requestParameters:
+#     {"modelName":"ExampleModel",
+#      "primaryContainer":{"image":"174872318107.dkr.ecr.us-west-2.amazonaws.com/kmeans:latest"},
+#      "executionRoleArn":"arn:aws:iam::123456789012:role/EXAMPLEARN"}
+#     This is the CASING GROUND TRUTH: CloudTrail lowercases ONLY the first character of each key
+#     and each nested key; interior capitals and acronyms survive (s3Uri, kmsKeyId, enableSSMAccess).
+#     Paths: requestParameters.modelName (FLAT), .primaryContainer.image, .executionRoleArn (FLAT)
+# CreateEndpoint — AWS-published example:
+#     requestParameters.endpointName (FLAT), requestParameters.endpointConfigName (FLAT)
+# CreateEndpointConfig — no published example:
+#     requestParameters.endpointConfigName (FLAT), .productionVariants[].modelName,
+#     .productionVariants[].instanceType, .productionVariants[].enableSSMAccess (boolean)
+#         ^ enableSSMAccess grants an SSM shell INTO the inference container — high-value signal
+#     .dataCaptureConfig.enableCapture, .dataCaptureConfig.destinationS3Uri
+# UpdateEndpoint — no published example:
+#     requestParameters.endpointName (FLAT), requestParameters.endpointConfigName (FLAT)
+#         ^ both required; a model swap is exactly "same endpointName, different endpointConfigName"
+#
+# --- WHY THE TRIGGER IS eventName ONLY ---
+# The strongest discriminators (a foreign-registry primaryContainer.image, enableSSMAccess=true) sit
+# in nested/array paths that cannot be verified in this environment — no model or endpoint has ever
+# been created here. The FLAT, AWS-example-confirmed fields (modelName, endpointName,
+# endpointConfigName, executionRoleArn) are carried as output context so a model swap is visible in
+# the alert as an endpointName paired with a changed endpointConfigName.
+#
+# --- OPTIONAL REFINEMENT (verify against a real event first) ---
+#   unmapped.requestParameters.%json.primaryContainer.image
+#   unmapped.requestParameters.%json.productionVariants.%json[0].enableSSMAccess
+#
+# FP Exceptions: sanctioned MLOps deployment pipelines / CI-CD roles added as `not (...)` lines.
+#   NOTE: in an active ML environment these operations are routine — expect to tune by principal.
+#   Severity is Medium for that reason; the anomaly is WHO deploys, not that a deploy happened.
+severity: Medium
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.product.feature.name = "sagemaker.amazonaws.com"
+  (api.operation = "CreateModel" or api.operation = "CreateEndpoint" or api.operation = "CreateEndpointConfig" or api.operation = "UpdateEndpoint")
+  | stats
+      count() as event_count,
+      countdistinct(src_endpoint.ip) as distinct_source_ips
+    by ig_tenant_id, %ingest.import_rule_name,
+       actor.user.uid,
+       unmapped.userIdentity.%json.arn,
+       unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn,
+       unmapped.userIdentity.%json.type,
+       api.operation,
+       unmapped.requestParameters.%json.modelName,
+       unmapped.requestParameters.%json.endpointName,
+       unmapped.requestParameters.%json.endpointConfigName,
+       unmapped.requestParameters.%json.executionRoleArn,
+       unmapped.awsRegion
+  | where(event_count >= 1)
+  | rename(
+      actor.user.uid as principal_uid,
+      unmapped.userIdentity.%json.arn as principal_arn,
+      unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn as role_arn,
+      unmapped.userIdentity.%json.type as identity_type,
+      api.operation as event_name,
+      unmapped.requestParameters.%json.modelName as model_name,
+      unmapped.requestParameters.%json.endpointName as endpoint_name,
+      unmapped.requestParameters.%json.endpointConfigName as endpoint_config_name,
+      unmapped.requestParameters.%json.executionRoleArn as execution_role_arn,
+      unmapped.awsRegion as aws_region
+    )
+
+tags:
+  - techniques.t1525.implant_internal_image
+  - atlas.aml_t0018.manipulate_ai_model
+
+time_range_s: 3600
+run_frequency_s: 900
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "AI Model Integrity"
+    - label: "incident_subtype"
+      value: "SageMaker Model or Endpoint Deployed or Modified"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "principal_uid"
+    - label: "key_entity"
+      value: "{{principal_uid}}"
+
+tests:
+  - name: "Positive - model created and endpoint repointed to a new configuration (model swap)"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"CreateModel","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.modelName":"rogue-model","unmapped.requestParameters.%json.executionRoleArn":"arn:aws:iam::111122223333:role/SageMakerExecutionRole","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+      {"timestamp":"2026-07-17T03:35:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"UpdateEndpoint","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.endpointName":"prod-inference","unmapped.requestParameters.%json.endpointConfigName":"rogue-config-v2","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - models and endpoints enumerated/described only"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"ListModels","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+      {"timestamp":"2026-07-17T03:31:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"DescribeEndpoint","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.endpointName":"prod-inference","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: false

@@ -1,0 +1,122 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "AWS SageMaker - Presigned Notebook URL Generated"
+enabled: true
+description: |
+  Detects generation of a presigned URL for an Amazon SageMaker notebook instance.
+  The resulting URL grants direct Jupyter access to the notebook, and AWS documents
+  that once it is created no additional permission is required to use it. It is
+  therefore a transferable, credential-free key to an interactive environment that
+  carries the notebook execution role's access to data, models and secrets. Anyone
+  who obtains the link - through sharing, interception, or exfiltration - gains that
+  access without authenticating, which makes generation of the URL itself the point
+  of control. Fires once per acting identity and notebook per window.
+
+  References:
+  * https://attack.mitre.org/techniques/T1550/ (Use of Alternate Authentication Material)
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_CreatePresignedNotebookInstanceUrl.html
+
+# MITRE ATT&CK: T1550 - Use of Alternate Authentication Material (TA0008); T1078.004 - Valid Accounts
+# MITRE ATLAS: AML.T0012 - Valid Accounts
+# OCSF Class: API Activity (6003)
+# Log Source: AWS CloudTrail (ocsf_mapped) — sagemaker.amazonaws.com, import_rule_name=api_activity
+# Threat: credential-free notebook access path / interactive ML environment takeover
+# Tier: 1 (purely AI-specific) · Control plane (CloudTrail management events, logged by default)
+# Enablement: NONE — SageMaker management events log by default.
+#
+# --- IDENTITY KEY (revised 2026-07-28) ---
+# incident_key must name a REAL field, so the eval/coalesce-derived `entity_id` was REMOVED.
+# Verified live against tenant 963f96f3 CloudTrail: actor.user.uid is OCSF-mapped and populated for
+# BOTH identity shapes —
+#     IAMUser     -> "AIDASWUZPRFJGCFUYL4VW"                        (IAM user principalId)
+#     AssumedRole -> "AROASWUZPRFJBFKVM2ROL:user@example.com"       (role principalId : session name)
+# It is therefore stable across STS sessions AND preserves per-human attribution under SSO, which the
+# old coalesce destroyed by collapsing every session of a shared role into one role ARN.
+# NOT used as the key, and why:
+#   actor.user.name        - the ROLE name on AssumedRole, and ABSENT entirely on IAMUser.
+#   actor.session.issuer   - NOT mapped for CloudTrail in this tenant (confirmed absent from the
+#                            live column set); referencing it would silently break the rule.
+# The two raw ARNs ride along as context columns (principal_arn, role_arn) for triage.
+#
+# --- FIELD GROUNDING (verified against AWS API Reference) ---
+# CreatePresignedNotebookInstanceUrl
+#     requestParameters.notebookInstanceName             (required, FLAT)
+#     requestParameters.sessionExpirationDurationInSeconds (OPTIONAL, FLAT; valid 1800-43200,
+#         default 12h). An unusually LONG expiry is a useful triage discriminator when present.
+#     Response schema field is AuthorizedUrl -> responseElements.authorizedUrl
+#
+# --- WHY responseElements.authorizedUrl IS NOT USED (deliberate) ---
+# AWS publishes NO CloudTrail example for this API and makes NO documented statement about whether
+# the generated URL is redacted. Both outcomes are plausible: AWS demonstrably uses
+# "HIDDEN_DUE_TO_SECURITY_REASONS" for sensitive payloads elsewhere in SageMaker, and a live
+# credential-bearing URL is an obvious redaction candidate — but that is inference, not documentation.
+# The rule therefore does NOT reference authorizedUrl in any capacity. Keying on it could silently
+# break the rule. Confirm the redaction behaviour against one real event before adding it.
+#
+# --- WHY THE TRIGGER IS eventName ONLY ---
+# Presigned-URL generation is inherently rare and always security-relevant, so no field condition is
+# required to make the rule meaningful. notebookInstanceName and the expiry are FLAT and
+# doc-grounded, so they are carried as output context per the Tier-1/2/3 rule.
+#
+# FP Exceptions: sanctioned notebook-access workflows / admin roles added as `not (...)` lines.
+#   Note that legitimate data scientists do use this API routinely — tune by principal, and treat
+#   generation by a non-human or long-term-credential identity as the higher-severity case.
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.product.feature.name = "sagemaker.amazonaws.com"
+  api.operation = "CreatePresignedNotebookInstanceUrl"
+  | stats
+      count() as event_count,
+      countdistinct(src_endpoint.ip) as distinct_source_ips
+    by ig_tenant_id, %ingest.import_rule_name,
+       actor.user.uid,
+       unmapped.userIdentity.%json.arn,
+       unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn,
+       unmapped.userIdentity.%json.type,
+       unmapped.requestParameters.%json.notebookInstanceName,
+       unmapped.requestParameters.%json.sessionExpirationDurationInSeconds,
+       unmapped.awsRegion
+  | where(event_count >= 1)
+  | rename(
+      actor.user.uid as principal_uid,
+      unmapped.userIdentity.%json.arn as principal_arn,
+      unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn as role_arn,
+      unmapped.userIdentity.%json.type as identity_type,
+      unmapped.requestParameters.%json.notebookInstanceName as notebook_name,
+      unmapped.requestParameters.%json.sessionExpirationDurationInSeconds as session_expiry_seconds,
+      unmapped.awsRegion as aws_region
+    )
+
+tags:
+  - techniques.t1550.use_alternate_authentication_material
+
+time_range_s: 3600
+run_frequency_s: 900
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "AI Infrastructure Exposure"
+    - label: "incident_subtype"
+      value: "SageMaker Presigned Notebook URL Generated"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "principal_uid"
+    - label: "key_entity"
+      value: "{{principal_uid}}"
+
+tests:
+  - name: "Positive - presigned notebook URL generated with a long expiry"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"CreatePresignedNotebookInstanceUrl","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.notebookInstanceName":"ds-notebook-01","unmapped.requestParameters.%json.sessionExpirationDurationInSeconds":43200,"unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - notebook described/enumerated only, no presigned URL generated"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"DescribeNotebookInstance","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.notebookInstanceName":"ds-notebook-01","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: false

@@ -1,0 +1,138 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "AWS SageMaker - Notebook Instance Created (Direct Internet Exposure Risk)"
+enabled: true
+description: |
+  Detects creation of an Amazon SageMaker notebook instance, surfacing its direct
+  internet access and network placement. A notebook instance is an interactive
+  compute environment holding the notebook execution role's permissions and, in
+  practice, direct access to training data, model artifacts and credentials. When it
+  is created with direct internet access - or without a subnet, in which case
+  internet access is the default - it becomes an internet-reachable foothold running
+  with ML-tier privileges, and a route for data to leave the environment. Fires once
+  per acting identity and notebook per window.
+
+  References:
+  * https://attack.mitre.org/techniques/T1578/002/ (Modify Cloud Compute Infrastructure: Create Cloud Instance)
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_CreateNotebookInstance.html
+
+# MITRE ATT&CK: T1578.002 - Modify Cloud Compute Infrastructure: Create Cloud Instance (TA0005)
+# MITRE ATLAS: AML.T0012 - Valid Accounts
+# OCSF Class: API Activity (6003)
+# Log Source: AWS CloudTrail (ocsf_mapped) — sagemaker.amazonaws.com, import_rule_name=api_activity
+# Threat: internet-exposed ML compute foothold with execution-role privileges / egress path
+# Tier: 1 (purely AI-specific) · Control plane (CloudTrail management events, logged by default)
+# Enablement: NONE — SageMaker management events log by default.
+#
+# --- IDENTITY KEY (revised 2026-07-28) ---
+# incident_key must name a REAL field, so the eval/coalesce-derived `entity_id` was REMOVED.
+# Verified live against tenant 963f96f3 CloudTrail: actor.user.uid is OCSF-mapped and populated for
+# BOTH identity shapes —
+#     IAMUser     -> "AIDASWUZPRFJGCFUYL4VW"                        (IAM user principalId)
+#     AssumedRole -> "AROASWUZPRFJBFKVM2ROL:user@example.com"       (role principalId : session name)
+# It is therefore stable across STS sessions AND preserves per-human attribution under SSO, which the
+# old coalesce destroyed by collapsing every session of a shared role into one role ARN.
+# NOT used as the key, and why:
+#   actor.user.name        - the ROLE name on AssumedRole, and ABSENT entirely on IAMUser.
+#   actor.session.issuer   - NOT mapped for CloudTrail in this tenant (confirmed absent from the
+#                            live column set); referencing it would silently break the rule.
+# The two raw ARNs ride along as context columns (principal_arn, role_arn) for triage.
+#
+# --- CORRECTION APPLIED FROM AWS DOCUMENTATION (important) ---
+# An earlier design included UpdateNotebookInstance in this rule. That is WRONG:
+# UpdateNotebookInstance has NO DirectInternetAccess field at all — the setting is create-only and
+# immutable. A rule matching directInternetAccess on UpdateNotebookInstance would NEVER FIRE.
+# This rule is therefore scoped to CreateNotebookInstance only. The genuine Update-side signals
+# (lifecycleConfigName swap, roleArn swap) are covered by the notebook lifecycle-config rule.
+#
+# --- FIELD GROUNDING (verified against AWS API Reference; POST CreateNotebookInstance) ---
+#     requestParameters.notebookInstanceName  (required, FLAT)
+#     requestParameters.directInternetAccess  (OPTIONAL, FLAT) valid values: "Enabled" | "Disabled"
+#     requestParameters.subnetId              (OPTIONAL, FLAT)
+#     requestParameters.roleArn               (required, FLAT)
+#     requestParameters.rootAccess            (FLAT) "Enabled" | "Disabled"
+#     requestParameters.instanceType, .volumeSizeInGB, .kmsKeyId, .lifecycleConfigName
+#
+# --- WHY THE TRIGGER IS eventName ONLY, NOT directInternetAccess = "Enabled" ---
+# AWS documents directInternetAccess as Required: No. The SDK OMITS unset optional fields entirely,
+# and the service DEFAULT is Enabled. So the most dangerous case — an internet-exposed notebook —
+# frequently appears as the field being ABSENT, not as the literal "Enabled". A trigger written as
+# directInternetAccess = "Enabled" would therefore MISS the common exposed case, and one written as
+# != "Disabled" depends on null-handling that cannot be verified here (no notebook has ever been
+# created in this environment). Notebook creation is rare and always worth review, so the rule
+# triggers on the event and emits directInternetAccess + subnetId as the triage discriminators:
+#     directInternetAccess = "Enabled"  -> explicitly exposed
+#     directInternetAccess absent/null  -> exposed by default  (treat as exposed)
+#     subnetId absent                   -> not VPC-attached, exposed regardless
+#     directInternetAccess = "Disabled" + subnetId present -> contained
+#
+# FP Exceptions: sanctioned notebook-provisioning pipelines / IaC roles added as `not (...)` lines.
+severity: High
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.product.feature.name = "sagemaker.amazonaws.com"
+  api.operation = "CreateNotebookInstance"
+  | stats
+      count() as event_count,
+      countdistinct(src_endpoint.ip) as distinct_source_ips
+    by ig_tenant_id, %ingest.import_rule_name,
+       actor.user.uid,
+       unmapped.userIdentity.%json.arn,
+       unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn,
+       unmapped.userIdentity.%json.type,
+       unmapped.requestParameters.%json.notebookInstanceName,
+       unmapped.requestParameters.%json.directInternetAccess,
+       unmapped.requestParameters.%json.subnetId,
+       unmapped.requestParameters.%json.roleArn,
+       unmapped.awsRegion
+  | where(event_count >= 1)
+  | rename(
+      actor.user.uid as principal_uid,
+      unmapped.userIdentity.%json.arn as principal_arn,
+      unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn as role_arn,
+      unmapped.userIdentity.%json.type as identity_type,
+      unmapped.requestParameters.%json.notebookInstanceName as notebook_name,
+      unmapped.requestParameters.%json.directInternetAccess as direct_internet_access,
+      unmapped.requestParameters.%json.subnetId as subnet_id,
+      unmapped.requestParameters.%json.roleArn as execution_role_arn,
+      unmapped.awsRegion as aws_region
+    )
+
+tags:
+  - techniques.t1578.modify_cloud_compute_infrastructure
+
+time_range_s: 3600
+run_frequency_s: 900
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "AI Infrastructure Exposure"
+    - label: "incident_subtype"
+      value: "SageMaker Notebook Instance Created (Internet Exposure Risk)"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "principal_uid"
+    - label: "key_entity"
+      value: "{{principal_uid}}"
+
+tests:
+  - name: "Positive - notebook created with direct internet access explicitly enabled"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"CreateNotebookInstance","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.notebookInstanceName":"exposed-nb","unmapped.requestParameters.%json.directInternetAccess":"Enabled","unmapped.requestParameters.%json.roleArn":"arn:aws:iam::111122223333:role/SageMakerExecutionRole","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: true
+
+  - name: "Positive - notebook created with directInternetAccess absent (default Enabled, no subnet)"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"CreateNotebookInstance","actor.user.uid":"AROASWUZPRFJBFKVM2ROL:raja.kushal@example.com","unmapped.userIdentity.%json.type":"AssumedRole","unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn":"arn:aws:iam::111122223333:role/data-science-role","unmapped.userIdentity.%json.arn":"arn:aws:sts::111122223333:assumed-role/data-science-role/raja.kushal@example.com","unmapped.requestParameters.%json.notebookInstanceName":"default-nb","unmapped.requestParameters.%json.roleArn":"arn:aws:iam::111122223333:role/SageMakerExecutionRole","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"13.127.43.67","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - notebook enumeration only, not creation"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"ListNotebookInstances","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: false

@@ -1,0 +1,140 @@
+# schema: https://scanner.dev/schema/scanner-detection-rule.v1.json
+name: "AWS SageMaker - Training or Processing Job Created"
+enabled: true
+description: |
+  Detects creation of an Amazon SageMaker training or processing job. Both APIs
+  start a container that runs with a caller-supplied image and an IAM role, reads
+  from storage, and writes results back out. That combination makes job creation a
+  general-purpose execution primitive: an attacker-supplied container image runs
+  arbitrary code under the job role's permissions, reads whatever data that role can
+  reach, and writes to a destination the attacker chooses. It is simultaneously a
+  compute-cost abuse vector and a data-egress path that never touches the inference
+  APIs. Fires once per acting identity, action and role per window.
+
+  References:
+  * https://attack.mitre.org/techniques/T1610/ (Deploy Container)
+  * https://attack.mitre.org/techniques/T1496/ (Resource Hijacking)
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_CreateTrainingJob.html
+  * https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_CreateProcessingJob.html
+
+# MITRE ATT&CK: T1610 - Deploy Container (TA0002 - Execution); T1496 - Resource Hijacking (TA0040)
+# MITRE ATLAS: AML.T0011 - User Execution
+# OCSF Class: API Activity (6003)
+# Log Source: AWS CloudTrail (ocsf_mapped) — sagemaker.amazonaws.com, import_rule_name=api_activity
+# Threat: arbitrary container execution under an ML role / compute abuse / data egress via job output
+# Tier: 1 (purely AI-specific) · Control plane (CloudTrail management events, logged by default)
+# Enablement: NONE — SageMaker management events log by default.
+#
+# --- IDENTITY KEY (revised 2026-07-28) ---
+# incident_key must name a REAL field, so the eval/coalesce-derived `entity_id` was REMOVED.
+# Verified live against tenant 963f96f3 CloudTrail: actor.user.uid is OCSF-mapped and populated for
+# BOTH identity shapes —
+#     IAMUser     -> "AIDASWUZPRFJGCFUYL4VW"                        (IAM user principalId)
+#     AssumedRole -> "AROASWUZPRFJBFKVM2ROL:user@example.com"       (role principalId : session name)
+# It is therefore stable across STS sessions AND preserves per-human attribution under SSO, which the
+# old coalesce destroyed by collapsing every session of a shared role into one role ARN.
+# NOT used as the key, and why:
+#   actor.user.name        - the ROLE name on AssumedRole, and ABSENT entirely on IAMUser.
+#   actor.session.issuer   - NOT mapped for CloudTrail in this tenant (confirmed absent from the
+#                            live column set); referencing it would silently break the rule.
+# The two raw ARNs ride along as context columns (principal_arn, role_arn) for triage.
+#
+# --- FIELD GROUNDING (verified against AWS API Reference; NO published CloudTrail example) ---
+# The two APIs use DIFFERENT key names for equivalent concepts. Getting this wrong silently misses.
+# CreateTrainingJob:
+#     requestParameters.trainingJobName                       (required, FLAT)
+#     requestParameters.roleArn                               (required, FLAT)
+#     requestParameters.algorithmSpecification.trainingImage   <- container image
+#     requestParameters.inputDataConfig[].dataSource.s3DataSource.s3Uri
+#     requestParameters.outputDataConfig.s3OutputPath          <- NOTE: s3OutputPath, NOT s3Uri
+#     requestParameters.enableNetworkIsolation                 <- TOP-LEVEL boolean here
+# CreateProcessingJob:
+#     requestParameters.processingJobName                     (required, FLAT)
+#     requestParameters.roleArn                               (required, FLAT)
+#     requestParameters.appSpecification.imageUri              <- NOTE: imageUri, NOT trainingImage
+#     requestParameters.processingInputs[].s3Input.s3Uri
+#     requestParameters.processingOutputConfig.outputs[].s3Output.s3Uri
+#     requestParameters.networkConfig.enableNetworkIsolation   <- NESTED here, not top-level
+# The only field name common to both is roleArn, which is why roleArn is the shared output column.
+# Egress-relevant combination worth reviewing when visible: enableNetworkIsolation false + no
+# vpcConfig + a container image from a registry outside the account = unrestricted container egress.
+#
+# --- WHY THE TRIGGER IS eventName ONLY ---
+# Every high-signal field above is either nested, array-based, or named differently between the two
+# APIs, and no training or processing job has ever run in this environment to verify any of them.
+# api.operation is OCSF-mapped and proven, so it is the sole trigger; both job-name fields are
+# emitted as separate output columns (one will be null per event, which is expected and harmless).
+#
+# --- OPTIONAL REFINEMENT (verify against a real event first) ---
+#   unmapped.requestParameters.%json.algorithmSpecification.trainingImage
+#   unmapped.requestParameters.%json.appSpecification.imageUri
+#   unmapped.requestParameters.%json.outputDataConfig.s3OutputPath
+#
+# FP Exceptions: sanctioned training pipelines / MLOps roles added as `not (...)` lines.
+#   NOTE: routine in an active ML environment — severity Medium; the anomaly is WHO submits the job.
+severity: Medium
+query_text: |
+  @index={ 81fe91d5-1dee-4321-8700-0d1c4f441770 | "ocsf_mapped" }
+  metadata.product.feature.name = "sagemaker.amazonaws.com"
+  (api.operation = "CreateTrainingJob" or api.operation = "CreateProcessingJob")
+  | stats
+      count() as event_count,
+      countdistinct(src_endpoint.ip) as distinct_source_ips
+    by ig_tenant_id, %ingest.import_rule_name,
+       actor.user.uid,
+       unmapped.userIdentity.%json.arn,
+       unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn,
+       unmapped.userIdentity.%json.type,
+       api.operation,
+       unmapped.requestParameters.%json.trainingJobName,
+       unmapped.requestParameters.%json.processingJobName,
+       unmapped.requestParameters.%json.roleArn,
+       unmapped.awsRegion
+  | where(event_count >= 1)
+  | rename(
+      actor.user.uid as principal_uid,
+      unmapped.userIdentity.%json.arn as principal_arn,
+      unmapped.userIdentity.%json.sessionContext.sessionIssuer.arn as role_arn,
+      unmapped.userIdentity.%json.type as identity_type,
+      api.operation as event_name,
+      unmapped.requestParameters.%json.trainingJobName as training_job_name,
+      unmapped.requestParameters.%json.processingJobName as processing_job_name,
+      unmapped.requestParameters.%json.roleArn as job_role_arn,
+      unmapped.awsRegion as aws_region
+    )
+
+tags:
+  - techniques.t1610.deploy_container
+  - techniques.t1496.resource_hijacking
+
+time_range_s: 3600
+run_frequency_s: 900
+
+alert_template:
+  info:
+    - label: "detectionid"
+      value: "{{@alert.id}}"
+    - label: "incident_type"
+      value: "AI Compute Abuse"
+    - label: "incident_subtype"
+      value: "SageMaker Training or Processing Job Created"
+    - label: "ruleid"
+      value: "{{@alert.detection_rule_id}}"
+    - label: "incident_key"
+      value: "principal_uid"
+    - label: "key_entity"
+      value: "{{principal_uid}}"
+
+tests:
+  - name: "Positive - training job and processing job created by an IAM user"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"CreateTrainingJob","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.trainingJobName":"rogue-training-01","unmapped.requestParameters.%json.roleArn":"arn:aws:iam::111122223333:role/SageMakerExecutionRole","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+      {"timestamp":"2026-07-17T03:35:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"CreateProcessingJob","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.requestParameters.%json.processingJobName":"rogue-processing-01","unmapped.requestParameters.%json.roleArn":"arn:aws:iam::111122223333:role/SageMakerExecutionRole","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: true
+
+  - name: "Negative - training jobs enumerated only, no job created"
+    now_timestamp: "2026-07-17T04:00:00.000Z"
+    dataset_inline: |
+      {"timestamp":"2026-07-17T03:30:00.000Z","metadata.product.feature.name":"sagemaker.amazonaws.com","api.operation":"ListTrainingJobs","actor.user.uid":"AIDASWUZPRFJGCFUYL4VW","unmapped.userIdentity.%json.type":"IAMUser","unmapped.userIdentity.%json.arn":"arn:aws:iam::111122223333:user/raja.kushal@example.com","unmapped.awsRegion":"ap-south-1","src_endpoint.ip":"202.75.240.6","ig_tenant_id":"test-tenant","%ingest.import_rule_name":"api_activity"}
+    expected_detection_result: false
